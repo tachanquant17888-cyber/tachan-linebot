@@ -126,45 +126,29 @@ def analyze_eps_with_groq(raw_text: str) -> str:
         return "⚠️ 無法取得 EPS 分析"
 
 
-# ── Groq 數字擷取（營收 + EPS） ───────────────
-def extract_financials_with_groq(raw_text: str) -> dict:
-    """
-    讓 LLM 擷取營收與 EPS 的原始數字，回傳 JSON。
-    成長率計算交給 Python，確保數學零誤差。
-
-    回傳結構：
-    {
-        "latest_month_revenue": float | null,   # 最近一月營業收入（百萬元）
-        "latest_quarter_revenue": float | null, # 最近一季營業收入（百萬元）
-        "latest_month_eps": float | null,       # 最近一月每股盈餘（元，虧損為負）
-        "latest_quarter_eps": float | null      # 最近一季每股盈餘（元，虧損為負）
-    }
-    """
+# ── Groq 營收數字擷取 ─────────────────────────
+def extract_revenue_with_groq(raw_text: str) -> dict:
+    """讓 LLM 只負責擷取營收數字，回傳 JSON"""
     system_prompt = "你是資料擷取系統，只輸出純 JSON，不輸出任何其他文字、markdown 標記或解釋。"
 
-    user_prompt = f"""從以下文本中擷取財務數字，以純 JSON 格式回傳：
+    user_prompt = f"""從以下文本中擷取營業收入資訊，以純 JSON 格式回傳：
 
 <raw_text>
 {raw_text}
 </raw_text>
 
-請擷取以下四個欄位：
-- latest_month_revenue：最近一月的「營業收入」數字（單位：百萬元）
-- latest_quarter_revenue：最近一季的「營業收入」數字（單位：百萬元）
-- latest_month_eps：最近一月的「每股盈餘/虧損」數字（單位：元；虧損請填負數，例如 (0.19) → -0.19）
-- latest_quarter_eps：最近一季的「每股盈餘/虧損」數字（單位：元；虧損請填負數）
+請擷取：
+- latest_month_revenue：最近一月的營業收入數字（單位：百萬元）
+- latest_quarter_revenue：最近一季的營業收入數字（單位：百萬元）
 
 回傳格式（純 JSON，不要 markdown 的 ```）：
-{{"latest_month_revenue": 數字或null, "latest_quarter_revenue": 數字或null, "latest_month_eps": 數字或null, "latest_quarter_eps": 數字或null}}
+{{"latest_month_revenue": 數字或null, "latest_quarter_revenue": 數字或null}}
 
 規則：
-- 營收只擷取「營業收入」欄位，不要拿「營業利益」或其他欄位
-- EPS 只擷取「每股盈餘」或「每股虧損」，不要拿「累計」欄位
+- 只擷取「營業收入」欄位，不要拿「營業利益」或其他欄位
 - 數字請轉為 float，例如 "1,234.56" → 1234.56
-- 帶括號的數字代表負數，例如 (0.19) → -0.19
-- 單位若非百萬元請自行換算（營收）；EPS 單位固定為元
-- 找不到就填 null
-- 若有多筆同期資料，保留日期較新的那一筆"""
+- 單位已經是百萬元就直接填，若原文單位不同請自行換算為百萬元
+- 找不到就填 null"""
 
     try:
         response = groq_client.chat.completions.create(
@@ -173,30 +157,27 @@ def extract_financials_with_groq(raw_text: str) -> dict:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            max_tokens=150,
+            max_tokens=100,
             temperature=0,
         )
         text = response.choices[0].message.content.strip()
+        # 移除可能的 markdown 包裹
         text = text.replace("```json", "").replace("```", "").strip()
         return json.loads(text)
     except (json.JSONDecodeError, Exception) as e:
-        print(f"Groq 財務數字擷取失敗: {e}")
-        return {
-            "latest_month_revenue": None,
-            "latest_quarter_revenue": None,
-            "latest_month_eps": None,
-            "latest_quarter_eps": None,
-        }
+        print(f"Groq 營收擷取失敗: {e}")
+        return {"latest_month_revenue": None, "latest_quarter_revenue": None}
 
 
-# ── Python 成長率計算 ─────────────────────────
+# ── Python 營收成長率計算 ─────────────────────
 def calc_revenue_growth(data: dict) -> str:
-    """用 Python 計算月營收較上季月均成長率"""
+    """用 Python 做數學運算，確保零誤差"""
     a = data.get("latest_month_revenue")
     b = data.get("latest_quarter_revenue")
 
     if a is None or b is None:
         return "⚠️ 無法計算營收月增率（缺少營收數據）"
+
     if b == 0:
         return "⚠️ 無法計算營收月增率（上季營收為零）"
 
@@ -211,64 +192,31 @@ def calc_revenue_growth(data: dict) -> str:
     )
 
 
-def calc_eps_growth(data: dict) -> str:
-    """用 Python 計算月 EPS 較上季月均 EPS 成長率"""
-    m = data.get("latest_month_eps")
-    q = data.get("latest_quarter_eps")
-
-    if m is None or q is None:
-        return "⚠️ 無法計算 EPS 月增率（缺少 EPS 數據）"
-
-    avg = q / 3
-
-    # 基期為零或正負號不同（如虧轉盈）時，成長率無意義，改用差值描述
-    if avg == 0:
-        return (
-            f"最近一月 EPS：{m:+.2f} 元\n"
-            f"上季月均 EPS：{avg:+.2f} 元\n"
-            f"⚠️ 上季月均 EPS 為零，無法計算成長率"
-        )
-
-    growth = ((m - avg) / abs(avg)) * 100
-    sign = "+" if growth >= 0 else ""
-
-    return (
-        f"最近一月 EPS：{m:+.2f} 元\n"
-        f"上季月均 EPS：{avg:+.2f} 元\n"
-        f"月 EPS 較上季月均成長：{sign}{growth:.2f}%"
-    )
-
-
-# ── 整合分析（EPS 文字 + 營收成長 + EPS 成長） ─
+# ── 整合分析（EPS + 營收） ────────────────────
 def analyze_with_groq(raw_text: str, company_id: str, company_name: str) -> str:
-    """整合 EPS 擷取 + 營收/EPS 成長率計算，回傳完整區塊"""
+    """整合 EPS 擷取 + 營收計算，回傳完整區塊"""
 
-    # Step 1: EPS 格式化文字（含公司債判斷）
+    # Step 1: EPS 分析
     eps_text = analyze_eps_with_groq(raw_text)
 
-    # 公司債/可轉債 → 跳過整筆
+    # 公司債/可轉債 → 跳過
     if "公司債/可轉債" in eps_text:
         return ""
 
-    # Step 2: 財務數字擷取（LLM 做一次，同時抓營收 + EPS）
-    financials = extract_financials_with_groq(raw_text)
+    # Step 2: 營收數字擷取（LLM）
+    revenue_data = extract_revenue_with_groq(raw_text)
 
-    # Step 3: 成長率計算（Python，確保數學零誤差）
-    revenue_text = calc_revenue_growth(financials)
-    eps_growth_text = calc_eps_growth(financials)
+    # Step 3: 營收成長率計算（Python）
+    revenue_text = calc_revenue_growth(revenue_data)
 
-    return (
-        f"【{company_id} {company_name}】\n"
-        f"{eps_text}\n\n"
-        f"{revenue_text}\n\n"
-        f"{eps_growth_text}"
-    )
+    return f"【{company_id} {company_name}】\n{eps_text}\n\n{revenue_text}"
 
 
 # ── MOPS 爬蟲 ────────────────────────────────
 def fetch_eps(year: str, month: str, day: str) -> str:
     date_key = f"{year}/{month}/{day}"
 
+    # 先查 cache
     cached = get_cache(date_key)
     if cached:
         return cached
@@ -317,10 +265,10 @@ def fetch_eps(year: str, month: str, day: str) -> str:
         for row in detail["result"]["data"]:
             raw_text = row[9]
             block = analyze_with_groq(raw_text, company_id, company_name)
-            if block:
+            if block:  # 過濾掉公司債回傳的空字串
                 blocks.append(block)
 
-        time.sleep(5)
+        time.sleep(5)  # 加長間隔，因為現在每筆多一次 Groq call
 
     if not blocks:
         result = "⚠️ 無法取得詳細 EPS 資料"
@@ -346,8 +294,6 @@ def scheduled_push():
     year = str(now.year - 1911)
     month = str(now.month).zfill(2)
     day = str(now.day).zfill(2)
-
-    print(f"開始執行排程推播: {year}/{month}/{day}")
 
     message = fetch_eps(year, month, day)
     users = load_users()
@@ -435,7 +381,7 @@ if __name__ == "__main__":
     conf.get_default().auth_token = os.environ['NGROK_AUTHTOKEN']
 
     scheduler = BackgroundScheduler(timezone="Asia/Taipei")
-    scheduler.add_job(scheduled_push, 'cron', hour=13, minute=30)
+    scheduler.add_job(scheduled_push, 'cron', hour=9, minute=0)
     scheduler.start()
 
     public_url = ngrok.connect(8000)

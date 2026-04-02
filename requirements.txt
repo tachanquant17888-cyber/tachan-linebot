@@ -1,3 +1,9 @@
 fastapi
 uvicorn
 line-bot-sdk
+pyngrok
+python-dotenv
+requests
+urllib3
+pandas
+apscheduler
