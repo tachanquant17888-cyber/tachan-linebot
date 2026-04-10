@@ -5,7 +5,7 @@ from linebot.v3.messaging import (
     TextMessage as TextMsg
 )
 from linebot.v3.webhook import WebhookHandler
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent,JoinEvent
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from groq import Groq
@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 import requests
 import urllib3
 import re
+from zoneinfo import ZoneInfo 
 import time
 import json
 import os
@@ -94,9 +95,7 @@ def analyze_eps_with_groq(raw_text: str) -> str:
 
 2. 若可正常擷取，請嚴格按照以下格式輸出（不要加標題或前綴文字）：
 最近一月(XXX年X月)：每股[盈餘/虧損] X.XX 元
-與去年同期增減：XXX%
 最近一季(XXX年第X季)：每股[盈餘/虧損] X.XX 元
-與去年同期增減：XXX%
 
 3. 若完全無法在文本中找到相關 EPS 資訊，請直接輸出：
 ⚠️ 無法取得 EPS 資訊
@@ -259,9 +258,8 @@ def analyze_with_groq(raw_text: str, company_id: str, company_name: str) -> str:
 
     return (
         f"【{company_id} {company_name}】\n"
-        f"{eps_text}\n\n"
-        f"{revenue_text}\n\n"
-        f"{eps_growth_text}"
+        f"{eps_growth_text}\n\n"
+        f"{revenue_text}"
     )
 
 
@@ -342,7 +340,14 @@ def fetch_eps(year: str, month: str, day: str) -> str:
 
 # ── 排程推播 ──────────────────────────────────
 def scheduled_push():
-    now = datetime.now()
+    tz = ZoneInfo("Asia/Taipei")
+    now = datetime.now(tz) - timedelta(days=1)  # ← 明確台灣時區
+
+    # 跳過週六(5)、週日(6)
+    if now.weekday() >= 5:
+        print(f"[Skip] {now.date()} 為假日，不推播")
+        return
+
     year = str(now.year - 1911)
     month = str(now.month).zfill(2)
     day = str(now.day).zfill(2)
@@ -382,21 +387,84 @@ async def webhook(request: Request, x_line_signature: str = Header(...)):
     return {"status": "ok"}
 
 
+# ── Webhook ───────────────────────────────────
+@app.get("/")
+def health_check():
+    return {"status": "ok"}
+
+
+@app.post("/webhook")
+async def webhook(request: Request, x_line_signature: str = Header(...)):
+    body = await request.body()
+    try:
+        handler.handle(body.decode(), x_line_signature)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "ok"}
+
+
+# ── Bot 被加入群組／聊天室 → 自動訂閱 ─────────
+@handler.add(JoinEvent)
+def handle_join(event):
+    source_type = event.source.type
+
+    if source_type == "group":
+        target_id = event.source.group_id
+    elif source_type == "room":
+        target_id = event.source.room_id
+    else:
+        return
+
+    save_user(target_id)
+
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMsg(type='text', text=(
+                    "✅ 已自動訂閱！\n"
+                    "每天早上 8:20 推播前一日 EPS 注意清單\n\n"
+                    "📋 其他指令：\n"
+                    "  今日 → 查今天 EPS 注意清單\n"
+                    "  1150327 → 查指定日期（民國年月日）\n"
+                    "  取消訂閱 → 停止推播"
+                ))]
+            )
+        )
+
+
+# ── 個人訊息處理 ──────────────────────────────
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_id = event.source.user_id
+    source_type = event.source.type
     text = event.message.text.strip()
 
     if text == "訂閱":
+        # 個人一定存 user_id
         save_user(user_id)
-        reply = "✅ 已訂閱！每天早上 9:00 自動推播 EPS 注意清單"
+
+        # 群組額外再存 group_id
+        if source_type == "group":
+            save_user(event.source.group_id)
+        elif source_type == "room":
+            save_user(event.source.room_id)
+
+        reply = "✅ 已訂閱！每天早上 9:00 自動推播前一日 EPS 注意清單"
 
     elif text == "取消訂閱":
         remove_user(user_id)
+
+        if source_type == "group":
+            remove_user(event.source.group_id)
+        elif source_type == "room":
+            remove_user(event.source.room_id)
+
         reply = "❌ 已取消訂閱"
 
     elif text in ["今日", "today"]:
-        now = datetime.now()
+        now = datetime.now(TZ)
         year = str(now.year - 1911)
         month = str(now.month).zfill(2)
         day = str(now.day).zfill(2)
@@ -413,7 +481,7 @@ def handle_message(event):
             "📋 指令說明：\n"
             "  今日 → 查今天 EPS 注意清單\n"
             "  1150327 → 查指定日期（民國年月日）\n"
-            "  訂閱 → 每天 9:00 自動推播\n"
+            "  訂閱 → 每天 8:20 自動推播\n"
             "  取消訂閱 → 停止推播"
         )
 
@@ -426,7 +494,6 @@ def handle_message(event):
             )
         )
 
-
 # ── 啟動 ─────────────────────────────────────
 if __name__ == "__main__":
     from pyngrok import ngrok, conf
@@ -435,7 +502,7 @@ if __name__ == "__main__":
     conf.get_default().auth_token = os.environ['NGROK_AUTHTOKEN']
 
     scheduler = BackgroundScheduler(timezone="Asia/Taipei")
-    scheduler.add_job(scheduled_push, 'cron', hour=13, minute=30)
+    scheduler.add_job(scheduled_push, 'cron', hour=9, minute=00)
     scheduler.start()
 
     public_url = ngrok.connect(8000)
