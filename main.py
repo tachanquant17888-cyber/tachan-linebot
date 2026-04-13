@@ -21,7 +21,7 @@ import time
 import json
 import os
 import threading
-
+from upstash_redis import Redis
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
@@ -30,8 +30,25 @@ configuration = Configuration(access_token=os.environ['LINE_CHANNEL_ACCESS_TOKEN
 handler = WebhookHandler(os.environ['LINE_CHANNEL_SECRET'])
 groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-USERS_FILE = "users.json"
+
 TZ = ZoneInfo("Asia/Taipei")
+# USERS_FILE = "users.json"
+
+# ── Upstash Redis ─────────────────────────────
+# 用 from_env() 會自動讀 UPSTASH_REDIS_REST_URL 和 UPSTASH_REDIS_REST_TOKEN
+try:
+    redis_client = Redis.from_env()
+    print("✅ Upstash Redis 已連線")
+except Exception as e:
+    print(f"⚠️ Upstash Redis 連線失敗,將 fallback 到記憶體: {e}")
+    redis_client = None
+
+# Redis key 名稱
+USERS_KEY = "linebot:users"
+
+# Fallback:Redis 連不到時用記憶體(重啟會消失,但至少不會 crash)
+_users_fallback: set = set()
+_users_lock = threading.Lock()
 
 # ── Cache ─────────────────────────────────────
 _cache: dict = {}
@@ -61,34 +78,79 @@ def set_cache(date_key: str, result: str):
 # ── 訂閱名單管理(thread-safe)──────────────────
 _users_lock = threading.Lock()
 
+# === 原始
+# def load_users() -> list:
+#     if not os.path.exists(USERS_FILE):
+#         return []
+#     try:
+#         with open(USERS_FILE, "r") as f:
+#             return json.load(f)
+#     except (json.JSONDecodeError, OSError) as e:
+#         print(f"[Warn] users.json 讀取失敗: {e}")
+#         return []
+
 
 def load_users() -> list:
-    if not os.path.exists(USERS_FILE):
-        return []
+    """從 Redis 讀取訂閱者列表"""
+    if redis_client is None:
+        with _users_lock:
+            return list(_users_fallback)
     try:
-        with open(USERS_FILE, "r") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"[Warn] users.json 讀取失敗: {e}")
-        return []
+        # smembers 回傳 set,轉成 list
+        users = redis_client.smembers(USERS_KEY)
+        return list(users) if users else []
+    except Exception as e:
+        print(f"[Redis] load_users 失敗,使用 fallback: {e}")
+        with _users_lock:
+            return list(_users_fallback)
 
+
+# ===原始
+# def save_user(user_id: str):
+#     with _users_lock:
+#         users = load_users()
+#         if user_id not in users:
+#             users.append(user_id)
+#             with open(USERS_FILE, "w") as f:
+#                 json.dump(users, f)
 
 def save_user(user_id: str):
-    with _users_lock:
-        users = load_users()
-        if user_id not in users:
-            users.append(user_id)
-            with open(USERS_FILE, "w") as f:
-                json.dump(users, f)
+    """加入訂閱者(Redis SET 自動去重)"""
+    if redis_client is None:
+        with _users_lock:
+            _users_fallback.add(user_id)
+        return
+    try:
+        redis_client.sadd(USERS_KEY, user_id)
+        print(f"[Redis] 新增訂閱者: {user_id}")
+    except Exception as e:
+        print(f"[Redis] save_user 失敗,寫入 fallback: {e}")
+        with _users_lock:
+            _users_fallback.add(user_id)
 
+
+# === 原始
+# def remove_user(user_id: str):
+#     with _users_lock:
+#         users = load_users()
+#         if user_id in users:
+#             users.remove(user_id)
+#             with open(USERS_FILE, "w") as f:
+#                 json.dump(users, f)
 
 def remove_user(user_id: str):
-    with _users_lock:
-        users = load_users()
-        if user_id in users:
-            users.remove(user_id)
-            with open(USERS_FILE, "w") as f:
-                json.dump(users, f)
+    """移除訂閱者"""
+    if redis_client is None:
+        with _users_lock:
+            _users_fallback.discard(user_id)
+        return
+    try:
+        redis_client.srem(USERS_KEY, user_id)
+        print(f"[Redis] 移除訂閱者: {user_id}")
+    except Exception as e:
+        print(f"[Redis] remove_user 失敗,從 fallback 移除: {e}")
+        with _users_lock:
+            _users_fallback.discard(user_id)
 
 
 # ── Groq 單次分析(EPS + 營收數字 + 成長率)────
@@ -579,5 +641,5 @@ if __name__ == "__main__":
     print("⚠️ 開發模式:reload=True 會造成 scheduler 重複啟動,僅供測試\n")
 
     port = int(os.environ.get("PORT", 8000))
-    # uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False) # 本地
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False) # Render
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False) # 本地
+    # uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False) # Render

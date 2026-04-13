@@ -7,3 +7,4 @@ urllib3
 pandas
 apscheduler
 groq
+upstash-redis
