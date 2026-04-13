@@ -157,6 +157,12 @@ def remove_user(user_id: str):
 def calc_revenue_growth(data: dict) -> str:
     a = data.get("latest_month_revenue")
     b = data.get("latest_quarter_revenue")
+    m_label = data.get("latest_month_label") or ""
+    q_label = data.get("latest_quarter_label") or ""
+
+    # label 顯示用,有就加括號,沒有就空字串
+    m_tag = f"({m_label})" if m_label else ""
+    q_tag = f"({q_label})" if q_label else ""
 
     if a is None or b is None:
         return "⚠️ 無法計算營收月增率(缺少營收數據)"
@@ -168,8 +174,8 @@ def calc_revenue_growth(data: dict) -> str:
     sign = "+" if growth >= 0 else ""
 
     return (
-        f"最近一月營收:{a:,.2f} 百萬\n"
-        f"上季月均營收:{avg:,.2f} 百萬\n"
+        f"最近一月營收{m_tag}:{a:,.2f} 百萬\n"
+        f"上季{q_tag}月均營收:{avg:,.2f} 百萬\n"
         f"月營收較上季月均成長:{sign}{growth:.2f}%"
     )
 
@@ -178,6 +184,12 @@ def calc_eps_growth(data: dict) -> str:
     m = data.get("latest_month_eps")
     q = data.get("latest_quarter_eps")
 
+    m_label = data.get("latest_month_label") or ""
+    q_label = data.get("latest_quarter_label") or ""
+
+    m_tag = f"({m_label})" if m_label else ""
+    q_tag = f"({q_label})" if q_label else ""
+
     if m is None or q is None:
         return "⚠️ 無法計算 EPS 月增率(缺少 EPS 數據)"
 
@@ -185,8 +197,8 @@ def calc_eps_growth(data: dict) -> str:
 
     if avg == 0:
         return (
-            f"最近一月 EPS:{m:+.2f} 元\n"
-            f"上季月均 EPS:{avg:+.2f} 元\n"
+            f"最近一月 EPS{m_tag}:{m:+.2f} 元\n"
+            f"上季{q_tag}月均 EPS:{avg:+.2f} 元\n"
             f"⚠️ 上季月均 EPS 為零,無法計算成長率"
         )
 
@@ -194,8 +206,8 @@ def calc_eps_growth(data: dict) -> str:
     sign = "+" if growth >= 0 else ""
 
     return (
-        f"最近一月 EPS:{m:+.2f} 元\n"
-        f"上季月均 EPS:{avg:+.2f} 元\n"
+        f"最近一月 EPS{m_tag}:{m:+.2f} 元\n"
+        f"上季{q_tag}月均 EPS:{avg:+.2f} 元\n"
         f"月 EPS 較上季月均成長:{sign}{growth:.2f}%"
     )
 
@@ -214,8 +226,8 @@ def analyze_with_groq_single(raw_text: str, company_id: str, company_name: str) 
   "is_bond": true/false,
   "latest_month_eps": 數字或null,
   "latest_quarter_eps": 數字或null,
-  "latest_month_label": "115年1月" 或 null,
-  "latest_quarter_label": "114年第4季" 或 null,
+  "latest_month_label": "115年1月" 或"X月" 或 null,
+  "latest_quarter_label": "114年第4季" 或 "第X季" 或 null,
   "latest_month_revenue": 數字或null,
   "latest_quarter_revenue": 數字或null
 }}
@@ -224,6 +236,9 @@ def analyze_with_groq_single(raw_text: str, company_id: str, company_name: str) 
 - is_bond: 若含「公司債」或「可轉債」填 true
 - EPS 虧損填負數,如 (0.19) → -0.19
 - 營收單位為百萬元
+- latest_month_label: 只填月份數字,例如「1月」、「11月」(不含年份)
+- latest_quarter_label: 只填季別,例如「第1季」、「第4季」
+- 月份/季別必須從文本擷取,不可推算
 - 找不到填 null"""
 
     try:
