@@ -552,7 +552,8 @@ def handle_join(event):
                 reply_token=event.reply_token,
                 messages=[TextMsg(type='text', text=(
                     "✅ 已自動訂閱!\n"
-                    "平日早上 8:30 推播前一交易日 EPS 注意清單\n\n"
+                    "平日早上 8:30 推播前一交易日注意股票的EPS\n"
+                    "平日下午 17:00 推播當日交易日注意股票的EPS \n"
                     "📋 其他指令:\n"
                     "  今日 → 查今天 EPS 注意清單\n"
                     "  1150327 → 查指定日期\n"
@@ -586,7 +587,7 @@ def handle_message(event):
         save_user(target_id)
         send_immediate_reply(
             event.reply_token,
-            "✅ 已訂閱!平日早上 8:30 自動推播前一日 EPS 注意清單"
+            "✅ 已訂閱!平日早上 8:30 自動推播前一日注意股EPS。 \n 平日下午 17:00 自動推播當日注意股EPS"
         )
 
     elif text == "取消訂閱":
