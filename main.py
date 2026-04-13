@@ -4,263 +4,195 @@ from linebot.v3.messaging import (
     ReplyMessageRequest, PushMessageRequest,
     TextMessage as TextMsg
 )
+from linebot.v3.messaging.exceptions import ApiException
 from linebot.v3.webhook import WebhookHandler
-from linebot.v3.webhooks import MessageEvent, TextMessageContent,JoinEvent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, JoinEvent
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from groq import Groq
 from typing import Optional
 from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
+from zoneinfo import ZoneInfo
 import requests
 import urllib3
 import re
-from zoneinfo import ZoneInfo 
 import time
 import json
 import os
+import threading
+
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
-app = FastAPI()
-
 configuration = Configuration(access_token=os.environ['LINE_CHANNEL_ACCESS_TOKEN'])
 handler = WebhookHandler(os.environ['LINE_CHANNEL_SECRET'])
-
 groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
 USERS_FILE = "users.json"
+TZ = ZoneInfo("Asia/Taipei")
 
 # ── Cache ─────────────────────────────────────
 _cache: dict = {}
+_cache_lock = threading.Lock()
 CACHE_TTL_HOURS = 1
 
 
 def get_cache(date_key: str) -> Optional[str]:
-    entry = _cache.get(date_key)
-    if entry and datetime.now() < entry["expired_at"]:
-        print(f"[Cache HIT] {date_key}")
-        return entry["result"]
+    with _cache_lock:
+        entry = _cache.get(date_key)
+        if entry and datetime.now() < entry["expired_at"]:
+            print(f"[Cache HIT] {date_key}")
+            return entry["result"]
     print(f"[Cache MISS] {date_key}")
     return None
 
 
 def set_cache(date_key: str, result: str):
-    _cache[date_key] = {
-        "result": result,
-        "expired_at": datetime.now() + timedelta(hours=CACHE_TTL_HOURS)
-    }
-    print(f"[Cache SET] {date_key}, 過期時間: {_cache[date_key]['expired_at']}")
+    with _cache_lock:
+        _cache[date_key] = {
+            "result": result,
+            "expired_at": datetime.now() + timedelta(hours=CACHE_TTL_HOURS)
+        }
+    print(f"[Cache SET] {date_key}")
 
 
-# ── 訂閱名單管理 ──────────────────────────────
-def load_users():
+# ── 訂閱名單管理(thread-safe)──────────────────
+_users_lock = threading.Lock()
+
+
+def load_users() -> list:
     if not os.path.exists(USERS_FILE):
         return []
-    with open(USERS_FILE, "r") as f:
-        return json.load(f)
-
-
-def save_user(user_id):
-    users = load_users()
-    if user_id not in users:
-        users.append(user_id)
-        with open(USERS_FILE, "w") as f:
-            json.dump(users, f)
-
-
-def remove_user(user_id):
-    users = load_users()
-    if user_id in users:
-        users.remove(user_id)
-        with open(USERS_FILE, "w") as f:
-            json.dump(users, f)
-
-
-# ── Groq EPS 分析 ─────────────────────────────
-def analyze_eps_with_groq(raw_text: str) -> str:
-    """讓 LLM 擷取 EPS 資訊，回傳格式化文字"""
-    system_prompt = "你是一個嚴格的資料擷取系統，只輸出最終的結構化結果，絕對禁止輸出任何問候語、解釋說明、思考過程或佔位符。"
-
-    user_prompt = f"""請從以下 <raw_text> 標籤內的台灣股市重大訊息中，擷取每股盈餘/虧損資訊。
-
-<raw_text>
-{raw_text}
-</raw_text>
-
-# 處理邏輯與輸出規則
-1. 若 <raw_text> 包含「公司債」或「可轉債」字樣，請直接輸出：
-⚠️ 公司債/可轉債訊息，無法提供 EPS 分析
-（且不要輸出其他任何文字）
-
-2. 若可正常擷取，請嚴格按照以下格式輸出（不要加標題或前綴文字）：
-最近一月(XXX年X月)：每股[盈餘/虧損] X.XX 元
-最近一季(XXX年第X季)：每股[盈餘/虧損] X.XX 元
-
-3. 若完全無法在文本中找到相關 EPS 資訊，請直接輸出：
-⚠️ 無法取得 EPS 資訊
-
-# 格式細則要求
-- 月份格式統一：如「115年01月」改為「115年1月」
-- 季度格式統一：如「114年第四季」改為「114年第4季」
-- 正負值判定：數值為負或帶括號（如 (0.19)），文字需寫「每股虧損 0.19 元」；正數則寫「每股盈餘」
-- 小數點對齊：不足兩位請補零，如 0.1 → 0.10，1 → 1.00
-- 增減百分比：若為負數請保留負號（如 -42%）；若原文為文字描述（如虧轉盈、年增等）請直接照寫，不要自行換算
-- 衝突處理：若有兩筆同一時期的 EPS 資訊，請保留日期較新的那一筆
-- 排除項目：不要輸出「最近四季累計」的資訊"""
-
     try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            max_tokens=300,
-            temperature=0,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"Groq EPS 分析失敗: {e}")
-        return "⚠️ 無法取得 EPS 分析"
+        with open(USERS_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[Warn] users.json 讀取失敗: {e}")
+        return []
 
 
-# ── Groq 數字擷取（營收 + EPS） ───────────────
-def extract_financials_with_groq(raw_text: str) -> dict:
-    """
-    讓 LLM 擷取營收與 EPS 的原始數字，回傳 JSON。
-    成長率計算交給 Python，確保數學零誤差。
-
-    回傳結構：
-    {
-        "latest_month_revenue": float | null,   # 最近一月營業收入（百萬元）
-        "latest_quarter_revenue": float | null, # 最近一季營業收入（百萬元）
-        "latest_month_eps": float | null,       # 最近一月每股盈餘（元，虧損為負）
-        "latest_quarter_eps": float | null      # 最近一季每股盈餘（元，虧損為負）
-    }
-    """
-    system_prompt = "你是資料擷取系統，只輸出純 JSON，不輸出任何其他文字、markdown 標記或解釋。"
-
-    user_prompt = f"""從以下文本中擷取財務數字，以純 JSON 格式回傳：
-
-<raw_text>
-{raw_text}
-</raw_text>
-
-請擷取以下四個欄位：
-- latest_month_revenue：最近一月的「營業收入」數字（單位：百萬元）
-- latest_quarter_revenue：最近一季的「營業收入」數字（單位：百萬元）
-- latest_month_eps：最近一月的「每股盈餘/虧損」數字（單位：元；虧損請填負數，例如 (0.19) → -0.19）
-- latest_quarter_eps：最近一季的「每股盈餘/虧損」數字（單位：元；虧損請填負數）
-
-回傳格式（純 JSON，不要 markdown 的 ```）：
-{{"latest_month_revenue": 數字或null, "latest_quarter_revenue": 數字或null, "latest_month_eps": 數字或null, "latest_quarter_eps": 數字或null}}
-
-規則：
-- 營收只擷取「營業收入」欄位，不要拿「營業利益」或其他欄位
-- EPS 只擷取「每股盈餘」或「每股虧損」，不要拿「累計」欄位
-- 數字請轉為 float，例如 "1,234.56" → 1234.56
-- 帶括號的數字代表負數，例如 (0.19) → -0.19
-- 單位若非百萬元請自行換算（營收）；EPS 單位固定為元
-- 找不到就填 null
-- 若有多筆同期資料，保留日期較新的那一筆"""
-
-    try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            max_tokens=150,
-            temperature=0,
-        )
-        text = response.choices[0].message.content.strip()
-        text = text.replace("```json", "").replace("```", "").strip()
-        return json.loads(text)
-    except (json.JSONDecodeError, Exception) as e:
-        print(f"Groq 財務數字擷取失敗: {e}")
-        return {
-            "latest_month_revenue": None,
-            "latest_quarter_revenue": None,
-            "latest_month_eps": None,
-            "latest_quarter_eps": None,
-        }
+def save_user(user_id: str):
+    with _users_lock:
+        users = load_users()
+        if user_id not in users:
+            users.append(user_id)
+            with open(USERS_FILE, "w") as f:
+                json.dump(users, f)
 
 
-# ── Python 成長率計算 ─────────────────────────
+def remove_user(user_id: str):
+    with _users_lock:
+        users = load_users()
+        if user_id in users:
+            users.remove(user_id)
+            with open(USERS_FILE, "w") as f:
+                json.dump(users, f)
+
+
+# ── Groq 單次分析(EPS + 營收數字 + 成長率)────
 def calc_revenue_growth(data: dict) -> str:
-    """用 Python 計算月營收較上季月均成長率"""
     a = data.get("latest_month_revenue")
     b = data.get("latest_quarter_revenue")
 
     if a is None or b is None:
-        return "⚠️ 無法計算營收月增率（缺少營收數據）"
+        return "⚠️ 無法計算營收月增率(缺少營收數據)"
     if b == 0:
-        return "⚠️ 無法計算營收月增率（上季營收為零）"
+        return "⚠️ 無法計算營收月增率(上季營收為零)"
 
     avg = b / 3
     growth = ((a - avg) / avg) * 100
     sign = "+" if growth >= 0 else ""
 
     return (
-        f"最近一月營收：{a:,.2f} 百萬\n"
-        f"上季月均營收：{avg:,.2f} 百萬\n"
-        f"月營收較上季月均成長：{sign}{growth:.2f}%"
+        f"最近一月營收:{a:,.2f} 百萬\n"
+        f"上季月均營收:{avg:,.2f} 百萬\n"
+        f"月營收較上季月均成長:{sign}{growth:.2f}%"
     )
 
 
 def calc_eps_growth(data: dict) -> str:
-    """用 Python 計算月 EPS 較上季月均 EPS 成長率"""
     m = data.get("latest_month_eps")
     q = data.get("latest_quarter_eps")
 
     if m is None or q is None:
-        return "⚠️ 無法計算 EPS 月增率（缺少 EPS 數據）"
+        return "⚠️ 無法計算 EPS 月增率(缺少 EPS 數據)"
 
     avg = q / 3
 
-    # 基期為零或正負號不同（如虧轉盈）時，成長率無意義，改用差值描述
     if avg == 0:
         return (
-            f"最近一月 EPS：{m:+.2f} 元\n"
-            f"上季月均 EPS：{avg:+.2f} 元\n"
-            f"⚠️ 上季月均 EPS 為零，無法計算成長率"
+            f"最近一月 EPS:{m:+.2f} 元\n"
+            f"上季月均 EPS:{avg:+.2f} 元\n"
+            f"⚠️ 上季月均 EPS 為零,無法計算成長率"
         )
 
     growth = ((m - avg) / abs(avg)) * 100
     sign = "+" if growth >= 0 else ""
 
     return (
-        f"最近一月 EPS：{m:+.2f} 元\n"
-        f"上季月均 EPS：{avg:+.2f} 元\n"
-        f"月 EPS 較上季月均成長：{sign}{growth:.2f}%"
+        f"最近一月 EPS:{m:+.2f} 元\n"
+        f"上季月均 EPS:{avg:+.2f} 元\n"
+        f"月 EPS 較上季月均成長:{sign}{growth:.2f}%"
     )
 
 
-# ── 整合分析（EPS 文字 + 營收成長 + EPS 成長） ─
-def analyze_with_groq(raw_text: str, company_id: str, company_name: str) -> str:
-    """整合 EPS 擷取 + 營收/EPS 成長率計算，回傳完整區塊"""
+def analyze_with_groq_single(raw_text: str, company_id: str, company_name: str) -> str:
+    """單次 Groq 呼叫:同時取得 EPS 描述 + 財務數字"""
+    system_prompt = "你是資料擷取系統,只輸出純 JSON,不輸出任何其他文字或 markdown。"
+    user_prompt = f"""從以下文本擷取財務資訊,回傳純 JSON:
 
-    # Step 1: EPS 格式化文字（含公司債判斷）
-    eps_text = analyze_eps_with_groq(raw_text)
+<raw_text>
+{raw_text}
+</raw_text>
 
-    # 公司債/可轉債 → 跳過整筆
-    if "公司債/可轉債" in eps_text:
-        return ""
+回傳格式:
+{{
+  "is_bond": true/false,
+  "latest_month_eps": 數字或null,
+  "latest_quarter_eps": 數字或null,
+  "latest_month_label": "115年1月" 或 null,
+  "latest_quarter_label": "114年第4季" 或 null,
+  "latest_month_revenue": 數字或null,
+  "latest_quarter_revenue": 數字或null
+}}
 
-    # Step 2: 財務數字擷取（LLM 做一次，同時抓營收 + EPS）
-    financials = extract_financials_with_groq(raw_text)
+規則:
+- is_bond: 若含「公司債」或「可轉債」填 true
+- EPS 虧損填負數,如 (0.19) → -0.19
+- 營收單位為百萬元
+- 找不到填 null"""
 
-    # Step 3: 成長率計算（Python，確保數學零誤差）
-    revenue_text = calc_revenue_growth(financials)
-    eps_growth_text = calc_eps_growth(financials)
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=200,
+            temperature=0,
+        )
+        text = response.choices[0].message.content.strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        data = json.loads(text)
 
-    return (
-        f"【{company_id} {company_name}】\n"
-        f"{eps_growth_text}\n\n"
-        f"{revenue_text}"
-    )
+        if data.get("is_bond"):
+            return ""
+
+        revenue_text = calc_revenue_growth(data)
+        eps_growth_text = calc_eps_growth(data)
+
+        return (
+            f"【{company_id} {company_name}】\n"
+            f"{eps_growth_text}\n\n"
+            f"{revenue_text}"
+        )
+
+    except Exception as e:
+        print(f"Groq 分析失敗 ({company_id}): {e}")
+        return f"【{company_id} {company_name}】\n⚠️ 無法取得分析"
 
 
 # ── MOPS 爬蟲 ────────────────────────────────
@@ -287,7 +219,22 @@ def fetch_eps(year: str, month: str, day: str) -> str:
         headers=headers,
     )
 
-    rows = response.json()["result"]["data"]
+    try:
+        data = response.json()
+        if not data or "result" not in data or data["result"] is None:
+            result = f"⚠️ {year}/{month}/{day} 查無資料或網站回傳異常"
+            set_cache(date_key, result)
+            return result
+        rows = data["result"].get("data", [])
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        print(f"解析 MOPS 資料時發生錯誤: {e}")
+        return f"⚠️ 無法解析 {year}/{month}/{day} 的資料"
+
+    if not rows:
+        result = f"{year}/{month}/{day} 無注意清單資料"
+        set_cache(date_key, result)
+        return result
+
     notice_items = [row for row in rows if "注意" in row[4]]
 
     if not notice_items:
@@ -296,29 +243,33 @@ def fetch_eps(year: str, month: str, day: str) -> str:
         return result
 
     blocks = []
-
     for item in notice_items:
         company_id = item[2]
         company_name = item[3]
         params = item[5]["parameters"]
 
-        detail_resp = session.post(
-            "https://mops.twse.com.tw/mops/api/t05st02_detail",
-            json=params,
-            headers=headers,
-        )
-        detail = detail_resp.json()
+        try:
+            detail_resp = session.post(
+                "https://mops.twse.com.tw/mops/api/t05st02_detail",
+                json=params,
+                headers=headers,
+            )
+            detail = detail_resp.json()
+        except Exception as e:
+            print(f"抓取 {company_id} 明細失敗: {e}")
+            continue
 
-        if detail["code"] != 200:
+        if detail.get("code") != 200:
             continue
 
         for row in detail["result"]["data"]:
             raw_text = row[9]
-            block = analyze_with_groq(raw_text, company_id, company_name)
+            block = analyze_with_groq_single(raw_text, company_id, company_name)
             if block:
                 blocks.append(block)
 
-        time.sleep(5)
+        # 避免被 MOPS 封 IP
+        time.sleep(2)
 
     if not blocks:
         result = "⚠️ 無法取得詳細 EPS 資料"
@@ -338,25 +289,128 @@ def fetch_eps(year: str, month: str, day: str) -> str:
     return result
 
 
-# ── 排程推播 ──────────────────────────────────
-def scheduled_push():
-    tz = ZoneInfo("Asia/Taipei")
-    now = datetime.now(tz) - timedelta(days=1)  # ← 明確台灣時區
+# ── 交易日工具 ────────────────────────────────
+def get_last_trading_day(now: datetime) -> datetime:
+    """
+    回傳「上一個可能的交易日」(僅處理週末,國定假日由 fetch_eps 回傳的
+    '無資料' 訊息判斷後,由 scheduled_push 繼續往前找)
+    """
+    d = now - timedelta(days=1)
+    while d.weekday() >= 5:  # 5=Sat, 6=Sun
+        d -= timedelta(days=1)
+    return d
 
-    # 跳過週六(5)、週日(6)
-    if now.weekday() >= 5:
-        print(f"[Skip] {now.date()} 為假日，不推播")
+
+def to_roc_ymd(d: datetime) -> tuple[str, str, str]:
+    return str(d.year - 1911), str(d.month).zfill(2), str(d.day).zfill(2)
+
+
+# ── LINE 推播輔助 ─────────────────────────────
+def _is_invalid_target_error(e: Exception) -> bool:
+    """判斷是否為使用者封鎖 / ID 失效,這類錯誤應清掉該訂閱者"""
+    if isinstance(e, ApiException):
+        # 400 通常是 invalid user id / blocked
+        return e.status in (400, 403, 404)
+    return False
+
+
+def push_final_result(target_id: str, message_text: str):
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        try:
+            line_bot_api.push_message(
+                PushMessageRequest(
+                    to=target_id,
+                    messages=[TextMsg(type='text', text=message_text)]
+                )
+            )
+        except Exception as e:
+            print(f"Push Message 失敗 ({target_id}): {e}")
+            if _is_invalid_target_error(e):
+                print(f"[Clean] 移除失效訂閱者 {target_id}")
+                remove_user(target_id)
+
+
+def send_immediate_reply(token: str, text: str):
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        try:
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=token,
+                    messages=[TextMsg(type='text', text=text)]
+                )
+            )
+        except Exception as e:
+            print(f"Reply 失敗: {e}")
+
+
+# ── 背景任務 ─────────────────────────────────
+def task_fetch_and_push(year: str, month: str, day: str, target_id: str):
+    """背景執行爬蟲,完成後 Push。包 try/except 避免 thread 靜默死亡"""
+    print(f"[Task] 背景抓取 {year}/{month}/{day} → {target_id}")
+    try:
+        result = fetch_eps(year, month, day)
+    except Exception as e:
+        print(f"[Task] fetch_eps 失敗: {e}")
+        result = f"⚠️ 查詢 {year}/{month}/{day} 失敗: {type(e).__name__}"
+    push_final_result(target_id, result)
+
+
+# ── 排程推播 ─────────────────────────────────
+def scheduled_push(mode: str = 'previous'):
+    """
+    排程推播
+    mode='previous': 推前一交易日(早上 08:30 用,會回推找有資料的交易日)
+    mode='today'   : 推今日資料(下午 17:00 用,不回推)
+    """
+    now_taipei = datetime.now(TZ)
+    print(f"[排程觸發] mode={mode}, 當前台灣時間: {now_taipei}")
+
+    # 週末不推
+    if now_taipei.weekday() >= 5:
+        print(f"[Skip] 今日 {now_taipei.date()} 為週末")
         return
 
-    year = str(now.year - 1911)
-    month = str(now.month).zfill(2)
-    day = str(now.day).zfill(2)
+    if mode == 'today':
+        # 下午盤後:直接抓今天,不回推
+        y, m, d = to_roc_ymd(now_taipei)
+        print(f"[排程-盤後] 查詢今日 {y}/{m}/{d}")
+        message = fetch_eps(y, m, d)
 
-    print(f"開始執行排程推播: {year}/{month}/{day}")
+        # 今日無資料就不推(避免騷擾)
+        if "無注意清單資料" in message or "查無資料" in message:
+            print(f"[Info] {y}/{m}/{d} 無注意清單,取消推播")
+            return
+    else:
+        # 早上:推前一交易日,最多回推 7 天(處理連假)
+        target_date = get_last_trading_day(now_taipei)
+        message = None
+        for _ in range(7):
+            y, m, d = to_roc_ymd(target_date)
+            print(f"[排程-早盤] 嘗試查詢 {y}/{m}/{d}")
+            msg = fetch_eps(y, m, d)
 
-    message = fetch_eps(year, month, day)
+            if "無注意清單資料" in msg or "查無資料" in msg:
+                print(f"[排程] {y}/{m}/{d} 無資料,往前一天")
+                target_date -= timedelta(days=1)
+                while target_date.weekday() >= 5:
+                    target_date -= timedelta(days=1)
+                continue
+
+            message = msg
+            break
+
+        if not message:
+            print("[Info] 回推 7 天仍無資料,取消推播")
+            return
+
     users = load_users()
+    if not users:
+        print("[Info] 目前無訂閱用戶")
+        return
 
+    print(f"[排程] 推播給 {len(users)} 位用戶")
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         for user_id in users:
@@ -368,10 +422,40 @@ def scheduled_push():
                     )
                 )
             except Exception as e:
-                print(f"推播失敗 {user_id}: {e}")
+                print(f"推播失敗給 {user_id}: {e}")
+                if _is_invalid_target_error(e):
+                    print(f"[Clean] 移除失效訂閱者 {user_id}")
+                    remove_user(user_id)
 
 
-# ── Webhook ───────────────────────────────────
+# ── Lifespan(必須在 FastAPI 建立前定義)──────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler = BackgroundScheduler(timezone="Asia/Taipei")
+    scheduler.add_job(
+        scheduled_push, 'cron',
+        day_of_week='mon-fri', hour=8, minute=30,
+        id='push_morning'
+    )
+
+    # 下午 17:00:推播「今日」自結資訊
+    scheduler.add_job(
+        scheduled_push, 'cron',
+        day_of_week='mon-fri', hour=17, minute=00,
+        args=['today'],
+        id='push_afternoon'
+    )
+    scheduler.start()
+    print("✅ Scheduler 已啟動 (平日 08:30 推前一日 / 17:00 推今日)")
+    yield
+    scheduler.shutdown()
+    print("🛑 Scheduler 已關閉")
+
+
+# ── FastAPI app(只建立一次!)─────────────────
+app = FastAPI(lifespan=lifespan)
+
+
 @app.get("/")
 def health_check():
     return {"status": "ok"}
@@ -387,35 +471,17 @@ async def webhook(request: Request, x_line_signature: str = Header(...)):
     return {"status": "ok"}
 
 
-# ── Webhook ───────────────────────────────────
-@app.get("/")
-def health_check():
-    return {"status": "ok"}
-
-
-@app.post("/webhook")
-async def webhook(request: Request, x_line_signature: str = Header(...)):
-    body = await request.body()
-    try:
-        handler.handle(body.decode(), x_line_signature)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"status": "ok"}
-
-
-# ── Bot 被加入群組／聊天室 → 自動訂閱 ─────────
+# ── Bot 被加入群組 / 聊天室 → 自動訂閱 ────────
 @handler.add(JoinEvent)
 def handle_join(event):
-    source_type = event.source.type
-
-    if source_type == "group":
+    target_id = None
+    if event.source.type == "group":
         target_id = event.source.group_id
-    elif source_type == "room":
+    elif event.source.type == "room":
         target_id = event.source.room_id
-    else:
-        return
 
-    save_user(target_id)
+    if target_id:
+        save_user(target_id)
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
@@ -423,88 +489,95 @@ def handle_join(event):
             ReplyMessageRequest(
                 reply_token=event.reply_token,
                 messages=[TextMsg(type='text', text=(
-                    "✅ 已自動訂閱！\n"
-                    "每天早上 8:20 推播前一日 EPS 注意清單\n\n"
-                    "📋 其他指令：\n"
+                    "✅ 已自動訂閱!\n"
+                    "平日早上 8:30 推播前一交易日 EPS 注意清單\n\n"
+                    "📋 其他指令:\n"
                     "  今日 → 查今天 EPS 注意清單\n"
-                    "  1150327 → 查指定日期（民國年月日）\n"
+                    "  1150327 → 查指定日期\n"
                     "  取消訂閱 → 停止推播"
                 ))]
             )
         )
 
 
-# ── 個人訊息處理 ──────────────────────────────
+# ── 文字訊息處理 ─────────────────────────────
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_id = event.source.user_id
     source_type = event.source.type
+    if source_type == "group":
+        target_id = event.source.group_id
+    elif source_type == "room":
+        target_id = event.source.room_id
+    else:
+        target_id = user_id
+
     text = event.message.text.strip()
 
+    # 過濾非關鍵字 / 非日期格式,完全不回話
+    is_keyword = text in ["訂閱", "取消訂閱", "今日", "today", "指令"]
+    is_date_query = bool(re.match(r"^\d{7}$", text))
+    if not (is_keyword or is_date_query):
+        return
+
     if text == "訂閱":
-        # 個人一定存 user_id
-        save_user(user_id)
-
-        # 群組額外再存 group_id
-        if source_type == "group":
-            save_user(event.source.group_id)
-        elif source_type == "room":
-            save_user(event.source.room_id)
-
-        reply = "✅ 已訂閱！每天早上 9:00 自動推播前一日 EPS 注意清單"
+        save_user(target_id)
+        send_immediate_reply(
+            event.reply_token,
+            "✅ 已訂閱!平日早上 8:30 自動推播前一日 EPS 注意清單"
+        )
 
     elif text == "取消訂閱":
-        remove_user(user_id)
+        remove_user(target_id)
+        send_immediate_reply(event.reply_token, "❌ 已取消訂閱")
 
-        if source_type == "group":
-            remove_user(event.source.group_id)
-        elif source_type == "room":
-            remove_user(event.source.room_id)
-
-        reply = "❌ 已取消訂閱"
-
-    elif text in ["今日", "today"]:
-        now = datetime.now(TZ)
-        year = str(now.year - 1911)
-        month = str(now.month).zfill(2)
-        day = str(now.day).zfill(2)
-        reply = fetch_eps(year, month, day)
-
-    elif re.match(r"^\d{7}$", text):
-        year = text[:3]
-        month = text[3:5]
-        day = text[5:7]
-        reply = fetch_eps(year, month, day)
-
-    else:
-        reply = (
-            "📋 指令說明：\n"
+    elif text == "指令":
+        send_immediate_reply(event.reply_token, (
+            "📋 指令說明:\n"
             "  今日 → 查今天 EPS 注意清單\n"
-            "  1150327 → 查指定日期（民國年月日）\n"
-            "  訂閱 → 每天 8:20 自動推播\n"
+            "  1150327 → 查指定日期\n"
+            "  訂閱 → 每天 8:30 自動推播\n"
             "  取消訂閱 → 停止推播"
-        )
+        ))
 
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMsg(type='text', text=reply)]
+    elif text in ["今日", "today"] or re.match(r"^\d{7}$", text):
+        if text in ["今日", "today"]:
+            now = datetime.now(TZ)
+            y, m, d = to_roc_ymd(now)
+        else:
+            y, m, d = text[:3], text[3:5], text[5:7]
+
+        date_key = f"{y}/{m}/{d}"
+        cached = get_cache(date_key)
+        if cached:
+            send_immediate_reply(event.reply_token, cached)
+        else:
+            send_immediate_reply(
+                event.reply_token,
+                f"🔍 正在查詢 {date_key} 資料,請稍候約 1 分鐘..."
             )
-        )
+            thread = threading.Thread(
+                target=task_fetch_and_push,
+                args=(y, m, d, target_id),
+                daemon=True,
+            )
+            thread.start()
+
 
 # ── 啟動 ─────────────────────────────────────
+# 開發模式:python main.py (會啟動 ngrok + reload,但 reload=True 會讓
+#           scheduler 跑兩份,因此開發時排程會重複觸發,僅測試用)
+# 正式模式:uvicorn main:app --host 0.0.0.0 --port 8000
+#           (不要開 reload,scheduler 才會只跑一次)
 if __name__ == "__main__":
     from pyngrok import ngrok, conf
     import uvicorn
 
     conf.get_default().auth_token = os.environ['NGROK_AUTHTOKEN']
-
-    scheduler = BackgroundScheduler(timezone="Asia/Taipei")
-    scheduler.add_job(scheduled_push, 'cron', hour=9, minute=00)
-    scheduler.start()
-
     public_url = ngrok.connect(8000)
     print(f"\n✅ Webhook URL: {public_url}/webhook\n")
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    print("⚠️ 開發模式:reload=True 會造成 scheduler 重複啟動,僅供測試\n")
+
+    port = int(os.environ.get("PORT", 8000))
+    # uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False) # 本地
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False) # Render

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Header, HTTPException,BackgroundTasks
+from fastapi import FastAPI, Request, Header, HTTPException
 from linebot.v3.messaging import (
     ApiClient, Configuration, MessagingApi,
     ReplyMessageRequest, PushMessageRequest,
@@ -18,6 +18,9 @@ from zoneinfo import ZoneInfo
 import time
 import json
 import os
+import threading # 必須引入
+from contextlib import asynccontextmanager
+
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
@@ -30,6 +33,7 @@ handler = WebhookHandler(os.environ['LINE_CHANNEL_SECRET'])
 groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
 USERS_FILE = "users.json"
+TZ = ZoneInfo("Asia/Taipei")
 
 # ── Cache ─────────────────────────────────────
 _cache: dict = {}
@@ -287,7 +291,26 @@ def fetch_eps(year: str, month: str, day: str) -> str:
         headers=headers,
     )
 
-    rows = response.json()["result"]["data"]
+    try:
+        data = response.json()
+        # 檢查 result 鍵值是否存在，且不是 None
+        if not data or "result" not in data or data["result"] is None:
+            result = f"⚠️ {year}/{month}/{day} 查無資料或網站回傳異常"
+            set_cache(date_key, result)
+            return result
+            
+        rows = data["result"].get("data", [])
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        print(f"解析 MOPS 資料時發生錯誤: {e}")
+        return f"⚠️ 無法解析 {year}/{month}/{day} 的資料"
+
+    # 如果 rows 是空的
+    if not rows:
+        result = f"{year}/{month}/{day} 無注意清單資料"
+        set_cache(date_key, result)
+        return result
+
+    # 繼續原本的 notice_items 邏輯...
     notice_items = [row for row in rows if "注意" in row[4]]
 
     if not notice_items:
@@ -318,6 +341,9 @@ def fetch_eps(year: str, month: str, day: str) -> str:
             if block:
                 blocks.append(block)
 
+        # 關鍵：每抓一家公司休息 2 秒，避免被 MOPS 封鎖 IP
+        time.sleep(2)
+
 
     if not blocks:
         result = "⚠️ 無法取得詳細 EPS 資料"
@@ -337,26 +363,49 @@ def fetch_eps(year: str, month: str, day: str) -> str:
     return result
 
 
+# ── 輔助函式：發送 Push Message ────────────────
+def push_final_result(target_id, message_text):
+    """用於背景任務完成後，主動推播結果"""
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        try:
+            line_bot_api.push_message(
+                PushMessageRequest(
+                    to=target_id,
+                    messages=[TextMsg(type='text', text=message_text)]
+                )
+            )
+        except Exception as e:
+            print(f"Push Message 失敗: {e}")
+
+
+# ── 背景任務執行邏輯 ────────────────────────────
+def task_fetch_and_push(year, month, day, target_id):
+    """在背景執行爬蟲並分析，完成後主動 Push"""
+    print(f"開始背景抓取任務: {year}/{month}/{day} for {target_id}")
+    result = fetch_eps(year, month, day)
+    push_final_result(target_id, result)
+
 # ── 排程推播 ──────────────────────────────────
 def scheduled_push():
-    TZ = ZoneInfo("Asia/Taipei")
-    now = datetime.now(TZ) - timedelta(days=1)  # ← 明確台灣時區
-    
-    # 判斷位移天數
-    # weekday(): 0=週一, 1=週二..., 6=週日
-    if now.weekday() == 0:
-        # 如果今天是週一，抓 3 天前（上週五）的資料
-        delta_days = 3
-    else:
-        # 其他日子抓 1 天前
-        delta_days = 1
-        
-    target_date = now - timedelta(days=delta_days)
 
-    # 跳過週六(5)、週日(6)
-    if now.weekday() >= 5:
-        print(f"[Skip] {now.date()} 為假日，不推播")
+    # 1. 取得「當下」的台灣時間
+    now_taipei = datetime.now(TZ)
+
+    print(f"[排程觸發] 當前台灣時間: {now_taipei}, weekday={now_taipei.weekday()}")
+
+
+    # 2. 如果今天是週六(5)或週日(6)，直接結束不執行
+    if now_taipei.weekday() >= 5:
+        print(f"[Skip] 今日 {now_taipei.date()} 為週末，不執行推播")
         return
+
+    # 3. 計算目標日期 (邏輯：週一抓3天前，其餘抓1天前)
+    # 週一(0) -> 減3天 (上週五)
+    # 週二~五 -> 減1天 (昨天)
+    delta = 3 if now_taipei.weekday() == 0 else 1
+    target_date = now_taipei - timedelta(days=delta)
+        
 
     year = str(target_date.year - 1911)
     month = str(target_date.month).zfill(2)
@@ -365,7 +414,15 @@ def scheduled_push():
     print(f"開始執行排程推播: {year}/{month}/{day}")
 
     message = fetch_eps(year, month, day)
+   # 如果那天真的沒資料，就不要打擾用戶
+    if "無注意清單資料" in message:
+        print(f"[Info] {year}/{month}/{day} 無注意清單，取消推播")
+        return
+
     users = load_users()
+    if not users:
+        print("[Info] 目前無訂閱用戶")
+        return
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
@@ -378,10 +435,20 @@ def scheduled_push():
                     )
                 )
             except Exception as e:
-                print(f"推播失敗 {user_id}: {e}")
+                # 這裡可以捕捉例如使用者封鎖 Bot 導致的發送失敗
+                print(f"推播失敗給用戶 {user_id}: {e}")
 
 
-
+def send_immediate_reply(token, text):
+    """封裝 Reply 方法"""
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=token,
+                messages=[TextMsg(type='text', text=text)]
+            )
+        )
 
 # ── Webhook ───────────────────────────────────
 @app.get("/")
@@ -402,16 +469,12 @@ async def webhook(request: Request, x_line_signature: str = Header(...)):
 # ── Bot 被加入群組／聊天室 → 自動訂閱 ─────────
 @handler.add(JoinEvent)
 def handle_join(event):
-    source_type = event.source.type
-
-    if source_type == "group":
-        target_id = event.source.group_id
-    elif source_type == "room":
-        target_id = event.source.room_id
-    else:
-        return
-
-    save_user(target_id)
+    # 判斷要存哪種 ID
+    target_id = event.source.group_id if event.source.type == "group" else \
+                event.source.room_id if event.source.type == "room" else None
+    
+    if target_id:
+        save_user(target_id)
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
@@ -420,10 +483,10 @@ def handle_join(event):
                 reply_token=event.reply_token,
                 messages=[TextMsg(type='text', text=(
                     "✅ 已自動訂閱！\n"
-                    "每天早上 8:20 推播前一日 EPS 注意清單\n\n"
+                    "平日早上 8:30 推播前一交易日 EPS 注意清單\n\n"
                     "📋 其他指令：\n"
                     "  今日 → 查今天 EPS 注意清單\n"
-                    "  1150327 → 查指定日期（民國年月日）\n"
+                    "  1150327 → 查指定日期\n"
                     "  取消訂閱 → 停止推播"
                 ))]
             )
@@ -433,76 +496,107 @@ def handle_join(event):
 # ── 個人訊息處理 ──────────────────────────────
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
+    # 統一獲取發送目標 ID (可能是個人 ID 或群組 ID)
     user_id = event.source.user_id
     source_type = event.source.type
+    target_id = event.source.group_id if source_type == "group" else \
+                event.source.room_id if source_type == "room" else user_id
+    
     text = event.message.text.strip()
-    reply = None   # 預設不回覆
+    # ─── 關鍵過濾區：只有符合以下條件才繼續執行 ───
+    # 定義關鍵字清單與正則表達式
+    is_keyword = text in ["訂閱", "取消訂閱", "今日", "today", "指令"]
+    is_date_query = bool(re.match(r"^\d{7}$", text))
+
+    # 如果既不是關鍵字，也不是日期格式，就直接 return，完全不回話
+    if not (is_keyword or is_date_query):
+        return
 
     if text == "訂閱":
         # 個人一定存 user_id
-        save_user(user_id)
-
-        # 群組額外再存 group_id
-        if source_type == "group":
-            save_user(event.source.group_id)
-        elif source_type == "room":
-            save_user(event.source.room_id)
-
-        reply = "✅ 已訂閱！每天早上 8:30 自動推播前一日 EPS 注意清單"
+        save_user(target_id)
+        reply_content = "✅ 已訂閱！平日早上 8:30 自動推播前一日 EPS 注意清單"
+        send_immediate_reply(event.reply_token, reply_content)
 
     elif text == "取消訂閱":
-        remove_user(user_id)
+        remove_user(target_id)
+        reply_content = "❌ 已取消訂閱"
+        send_immediate_reply(event.reply_token, reply_content)
 
-        if source_type == "group":
-            remove_user(event.source.group_id)
-        elif source_type == "room":
-            remove_user(event.source.room_id)
 
-        reply = "❌ 已取消訂閱"
-
-    elif text in ["今日", "today"]:
-        now = datetime.now(TZ)
-        year = str(now.year - 1911)
-        month = str(now.month).zfill(2)
-        day = str(now.day).zfill(2)
-        reply = fetch_eps(year, month, day)
-
-    elif re.match(r"^\d{7}$", text):
-        year = text[:3]
-        month = text[3:5]
-        day = text[5:7]
-        reply = fetch_eps(year, month, day)
-    
     elif text == "指令":
-        reply = (
+        reply_content = (
             "📋 指令說明：\n"
             "  今日 → 查今天 EPS 注意清單\n"
-            "  1150327 → 查指定日期（民國年月日）\n"
+            "  1150327 → 查指定日期\n"
             "  訂閱 → 每天 8:20 自動推播\n"
             "  取消訂閱 → 停止推播"
         )
+        send_immediate_reply(event.reply_token, reply_content)
+    # 2. 處理需要爬蟲的高耗時請求 (先 Reply，再開 Thread 背景處理)
+    elif text in ["今日", "today"] or re.match(r"^\d{7}$", text):
+        if text in ["今日", "today"]:
+            now = datetime.now(TZ)
+            y, m, d = str(now.year - 1911), str(now.month).zfill(2), str(now.day).zfill(2)
+        else:
+            y, m, d = text[:3], text[3:5], text[5:7]
         
-    if reply:
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMsg(type='text', text=reply)]
-                )
-            )
+        # 先檢查 Cache，如果有資料就直接 Reply (不用等)
+        date_key = f"{y}/{m}/{d}"
+        cached = get_cache(date_key)
+        if cached:
+            send_immediate_reply(event.reply_token, cached)
+        else:
+            # 沒快取，先回覆「處理中」，然後開背景執行緒
+            send_immediate_reply(event.reply_token, f"🔍 正在查詢 {date_key} 資料，請稍候約 1 分鐘...")
+            
+            # 啟動 Thread 跑爬蟲
+            thread = threading.Thread(target=task_fetch_and_push, args=(y, m, d, target_id))
+            thread.start()    
+        
 
-# ── 啟動 ─────────────────────────────────────
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 啟動時
+    scheduler = BackgroundScheduler(timezone="Asia/Taipei")
+    scheduler.add_job(scheduled_push, 'cron', day_of_week='mon-fri', hour=8, minute=30, id='push_morning')
+    scheduler.add_job(scheduled_push, 'cron', day_of_week='mon-fri', hour=17, minute=11, id='push_afternoon')
+    scheduler.start()
+    print("✅ Scheduler 已啟動")
+    yield
+    # 關閉時
+    scheduler.shutdown()
+
+app = FastAPI(lifespan=lifespan)
+
 if __name__ == "__main__":
     from pyngrok import ngrok, conf
     import uvicorn
 
     conf.get_default().auth_token = os.environ['NGROK_AUTHTOKEN']
 
-    scheduler = BackgroundScheduler(timezone="Asia/Taipei")
-    scheduler.add_job(scheduled_push, 'cron', hour=14, minute=5)
-    scheduler.start()
-
     public_url = ngrok.connect(8000)
     print(f"\n✅ Webhook URL: {public_url}/webhook\n")
+
+    # reload=True 測試時可以開，正式建議關掉
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+# # ── 啟動 ─────────────────────────────────────
+# if __name__ == "__main__":
+#     from pyngrok import ngrok, conf
+#     import uvicorn
+
+
+#     conf.get_default().auth_token = os.environ['NGROK_AUTHTOKEN']
+
+#     scheduler = BackgroundScheduler(timezone="Asia/Taipei")
+#     scheduler.add_job(scheduled_push, 'cron',day_of_week='mon-fri', hour=8, minute=26,id='push_morning')
+#     scheduler.add_job(scheduled_push, 'cron',day_of_week='mon-fri', hour=17, minute=11,id='push_afternoon')
+#     scheduler.start()
+
+#     public_url = ngrok.connect(8000)
+#     print(f"\n✅ Webhook URL: {public_url}/webhook\n")
+#     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
