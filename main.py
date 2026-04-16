@@ -226,15 +226,16 @@ def analyze_with_groq_single(raw_text: str, company_id: str, company_name: str) 
   "is_bond": true/false,
   "latest_month_eps": 數字或null,
   "latest_quarter_eps": 數字或null,
-  "latest_month_label": "115年1月" 或"X月" 或 null,
-  "latest_quarter_label": "114年第4季" 或 "第X季" 或 null,
+  "latest_month_label": "X月" 或 null,
+  "latest_quarter_label": "第X季" 或 null,
   "latest_month_revenue": 數字或null,
   "latest_quarter_revenue": 數字或null
 }}
 
 規則:
-- is_bond: 若含「公司債」或「可轉債」填 true
-- EPS 虧損填負數,如 (0.19) → -0.19
+- is_bond: 若含「公司債」或「可轉債」填 true,其餘填false
+- EPS跟每股盈餘如果是虧損請填負數,如 (0.19) → -0.19
+- 括號數字 = 負數,例如 (0.06) → -0.06、(19.32) → -19.32
 - 營收單位為百萬元
 - latest_month_label: 只填月份數字,例如「1月」、「11月」(不含年份)
 - latest_quarter_label: 只填季別,例如「第1季」、「第4季」
@@ -248,7 +249,7 @@ def analyze_with_groq_single(raw_text: str, company_id: str, company_name: str) 
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            max_tokens=200,
+            max_tokens=300,
             temperature=0,
         )
         text = response.choices[0].message.content.strip()
@@ -295,6 +296,8 @@ def fetch_eps(year: str, month: str, day: str) -> str:
         json={"year": year, "month": month, "day": day},
         headers=headers,
     )
+
+    print(f"response : {response.json()}")
 
     try:
         data = response.json()
@@ -658,4 +661,5 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False) # 本地
+    fetch_eps('115','04','15')
     # uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False) # Render
