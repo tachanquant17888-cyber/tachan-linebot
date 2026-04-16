@@ -253,7 +253,7 @@ def analyze_with_groq_single(raw_text: str, company_id: str, company_name: str) 
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            max_tokens=300,
+            max_tokens=250,
             temperature=0,
         )
         text = response.choices[0].message.content.strip()
