@@ -232,11 +232,15 @@ def analyze_with_groq_single(raw_text: str, company_id: str, company_name: str) 
   "latest_quarter_revenue": 數字或null
 }}
 
-規則:
+欄位對應規則(重要):
+- 表格通常有「最近一月」或「近一月」和「最近一季」或「最近一期」或「近一季」兩欄數字
+- 「每股盈餘」或「EPS」那列 → 取出 latest_month_eps 和 latest_quarter_eps
+- 「營業收入」那列 → 取出 latest_month_revenue 和 latest_quarter_revenue(單位:百萬)
 - is_bond: 若含「公司債」或「可轉債」填 true,其餘填false
 - EPS跟每股盈餘如果是虧損請填負數,如 (0.19) → -0.19
 - 括號數字 = 負數,例如 (0.06) → -0.06、(19.32) → -19.32
 - 營收單位為百萬元
+- 百分比欄位(如「與去年同期增減%」)不是我們要的,要跳過
 - latest_month_label: 只填月份數字,例如「1月」、「11月」(不含年份)
 - latest_quarter_label: 只填季別,例如「第1季」、「第4季」
 - 月份/季別必須從文本擷取,不可推算
