@@ -30,90 +30,73 @@ configuration = Configuration(access_token=os.environ['LINE_CHANNEL_ACCESS_TOKEN
 handler = WebhookHandler(os.environ['LINE_CHANNEL_SECRET'])
 groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
+
 TZ = ZoneInfo("Asia/Taipei")
+# USERS_FILE = "users.json"
 
 # ── Upstash Redis ─────────────────────────────
+# 用 from_env() 會自動讀 UPSTASH_REDIS_REST_URL 和 UPSTASH_REDIS_REST_TOKEN
 try:
     redis_client = Redis.from_env()
     print("✅ Upstash Redis 已連線")
 except Exception as e:
-    print(f"⚠️ Upstash Redis 連線失敗: {e}")
+    print(f"⚠️ Upstash Redis 連線失敗,將 fallback 到記憶體: {e}")
     redis_client = None
 
-# Redis key 定義
+# Redis key 名稱
 USERS_KEY = "linebot:users"
-RESULT_KEY_PREFIX = "mops:result:"          # 抓取結果 (TTL 5hr)
-COMPANIES_KEY_PREFIX = "mops:companies:"    # 已推播的公司代號 SET (TTL 24hr)
 
-# Fallback
+# Fallback:Redis 連不到時用記憶體(重啟會消失,但至少不會 crash)
 _users_fallback: set = set()
 _users_lock = threading.Lock()
 
-
-# ── 結果 Cache (Redis) ────────────────────────
-RESULT_TTL_SECONDS = 5 * 60 * 60       # 5 小時
-COMPANIES_TTL_SECONDS = 24 * 60 * 60   # 24 小時
-
-
-def get_cached_result(date_key: str) -> Optional[str]:
-    if redis_client is None:
-        return None
-    try:
-        key = f"{RESULT_KEY_PREFIX}{date_key}"
-        result = redis_client.get(key)
-        if result:
-            print(f"[Redis HIT] {date_key}")
-            return result
-        print(f"[Redis MISS] {date_key}")
-        return None
-    except Exception as e:
-        print(f"[Redis] get_cached_result 失敗: {e}")
-        return None
+# ── Cache ─────────────────────────────────────
+_cache: dict = {}
+_cache_lock = threading.Lock()
+CACHE_TTL_HOURS = 1
 
 
-def set_cached_result(date_key: str, result: str):
-    if redis_client is None:
-        return
-    try:
-        key = f"{RESULT_KEY_PREFIX}{date_key}"
-        redis_client.set(key, result, ex=RESULT_TTL_SECONDS)
-        print(f"[Redis SET] {date_key} (TTL {RESULT_TTL_SECONDS}s)")
-    except Exception as e:
-        print(f"[Redis] set_cached_result 失敗: {e}")
+def get_cache(date_key: str) -> Optional[str]:
+    with _cache_lock:
+        entry = _cache.get(date_key)
+        if entry and datetime.now() < entry["expired_at"]:
+            print(f"[Cache HIT] {date_key}")
+            return entry["result"]
+    print(f"[Cache MISS] {date_key}")
+    return None
 
 
-def get_pushed_companies(date_key: str) -> set:
-    """取得該日期已推播過的公司代號集合"""
-    if redis_client is None:
-        return set()
-    try:
-        key = f"{COMPANIES_KEY_PREFIX}{date_key}"
-        members = redis_client.smembers(key)
-        return set(members) if members else set()
-    except Exception as e:
-        print(f"[Redis] get_pushed_companies 失敗: {e}")
-        return set()
+def set_cache(date_key: str, result: str):
+    with _cache_lock:
+        _cache[date_key] = {
+            "result": result,
+            "expired_at": datetime.now() + timedelta(hours=CACHE_TTL_HOURS)
+        }
+    print(f"[Cache SET] {date_key}")
 
 
-def add_pushed_companies(date_key: str, company_ids: list[str]):
-    """把公司代號加入已推播集合 (Redis SET, TTL 24hr)"""
-    if redis_client is None or not company_ids:
-        return
-    try:
-        key = f"{COMPANIES_KEY_PREFIX}{date_key}"
-        redis_client.sadd(key, *company_ids)
-        redis_client.expire(key, COMPANIES_TTL_SECONDS)
-        print(f"[Redis] 已記錄 {len(company_ids)} 家公司至 {key}")
-    except Exception as e:
-        print(f"[Redis] add_pushed_companies 失敗: {e}")
+# ── 訂閱名單管理(thread-safe)──────────────────
+_users_lock = threading.Lock()
+
+# === 原始
+# def load_users() -> list:
+#     if not os.path.exists(USERS_FILE):
+#         return []
+#     try:
+#         with open(USERS_FILE, "r") as f:
+#             return json.load(f)
+#     except (json.JSONDecodeError, OSError) as e:
+#         print(f"[Warn] users.json 讀取失敗: {e}")
+#         return []
 
 
-# ── 訂閱名單管理 ──────────────────────────────
 def load_users() -> list:
+    """從 Redis 讀取訂閱者列表"""
     if redis_client is None:
         with _users_lock:
             return list(_users_fallback)
     try:
+        # smembers 回傳 set,轉成 list
         users = redis_client.smembers(USERS_KEY)
         return list(users) if users else []
     except Exception as e:
@@ -122,7 +105,17 @@ def load_users() -> list:
             return list(_users_fallback)
 
 
+# ===原始
+# def save_user(user_id: str):
+#     with _users_lock:
+#         users = load_users()
+#         if user_id not in users:
+#             users.append(user_id)
+#             with open(USERS_FILE, "w") as f:
+#                 json.dump(users, f)
+
 def save_user(user_id: str):
+    """加入訂閱者(Redis SET 自動去重)"""
     if redis_client is None:
         with _users_lock:
             _users_fallback.add(user_id)
@@ -131,12 +124,22 @@ def save_user(user_id: str):
         redis_client.sadd(USERS_KEY, user_id)
         print(f"[Redis] 新增訂閱者: {user_id}")
     except Exception as e:
-        print(f"[Redis] save_user 失敗: {e}")
+        print(f"[Redis] save_user 失敗,寫入 fallback: {e}")
         with _users_lock:
             _users_fallback.add(user_id)
 
 
+# === 原始
+# def remove_user(user_id: str):
+#     with _users_lock:
+#         users = load_users()
+#         if user_id in users:
+#             users.remove(user_id)
+#             with open(USERS_FILE, "w") as f:
+#                 json.dump(users, f)
+
 def remove_user(user_id: str):
+    """移除訂閱者"""
     if redis_client is None:
         with _users_lock:
             _users_fallback.discard(user_id)
@@ -145,18 +148,19 @@ def remove_user(user_id: str):
         redis_client.srem(USERS_KEY, user_id)
         print(f"[Redis] 移除訂閱者: {user_id}")
     except Exception as e:
-        print(f"[Redis] remove_user 失敗: {e}")
+        print(f"[Redis] remove_user 失敗,從 fallback 移除: {e}")
         with _users_lock:
             _users_fallback.discard(user_id)
 
 
-# ── 成長率計算 ────────────────────────────────
+# ── Groq 單次分析(EPS + 營收數字 + 成長率)────
 def calc_revenue_growth(data: dict) -> str:
     a = data.get("latest_month_revenue")
     b = data.get("latest_quarter_revenue")
     m_label = data.get("latest_month_label") or ""
     q_label = data.get("latest_quarter_label") or ""
 
+    # label 顯示用,有就加括號,沒有就空字串
     m_tag = f"({m_label})" if m_label else ""
     q_tag = f"({q_label})" if q_label else ""
 
@@ -179,6 +183,7 @@ def calc_revenue_growth(data: dict) -> str:
 def calc_eps_growth(data: dict) -> str:
     m = data.get("latest_month_eps")
     q = data.get("latest_quarter_eps")
+
     m_label = data.get("latest_month_label") or ""
     q_label = data.get("latest_quarter_label") or ""
 
@@ -207,7 +212,6 @@ def calc_eps_growth(data: dict) -> str:
     )
 
 
-# ── Groq 分析 ────────────────────────────────
 def analyze_with_groq_single(raw_text: str, company_id: str, company_name: str) -> str:
     """單次 Groq 呼叫:同時取得 EPS 描述 + 財務數字"""
     system_prompt = "你是資料擷取系統,只輸出純 JSON,不輸出任何其他文字或 markdown。"
@@ -274,84 +278,69 @@ def analyze_with_groq_single(raw_text: str, company_id: str, company_name: str) 
 
 
 # ── MOPS 爬蟲 ────────────────────────────────
-def _create_mops_session():
-    """建立 MOPS 用的 requests.Session"""
+def fetch_eps(year: str, month: str, day: str) -> str:
+    date_key = f"{year}/{month}/{day}"
+
+    cached = get_cache(date_key)
+    if cached:
+        return cached
+
     session = requests.Session()
     session.verify = False
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/146.0.0.0 Safari/537.36",
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         "Origin": "https://mops.twse.com.tw",
         "Referer": "https://mops.twse.com.tw/mops/web/t05st02",
         "content-type": "application/json",
-    })
-    session.get("https://mops.twse.com.tw/mops/web/t05st02")
-    return session
+    }
 
-
-def _fetch_notice_items(session, year: str, month: str, day: str) -> Optional[list]:
-    """
-    從 MOPS 抓取注意清單原始資料
-    回傳 notice_items list,無資料回傳空 list,解析失敗回傳 None
-    """
+    session.get("https://mops.twse.com.tw/mops/web/t05st02", headers=headers)
     response = session.post(
         "https://mops.twse.com.tw/mops/api/t05st02",
         json={"year": year, "month": month, "day": day},
+        headers=headers,
     )
+
+    print(f"response : {response.json()}")
 
     try:
         data = response.json()
-        print(f"response : {data}")
         if not data or "result" not in data or data["result"] is None:
-            return []
+            result = f"⚠️ {year}/{month}/{day} 查無資料或網站回傳異常"
+            set_cache(date_key, result)
+            return result
         rows = data["result"].get("data", [])
     except (json.JSONDecodeError, KeyError, TypeError) as e:
         print(f"解析 MOPS 資料時發生錯誤: {e}")
-        return None
+        return f"⚠️ 無法解析 {year}/{month}/{day} 的資料"
 
     if not rows:
-        return []
+        result = f"{year}/{month}/{day} 無注意清單資料"
+        set_cache(date_key, result)
+        return result
 
-    notice_items = []
-    for row in rows:
-        if "注意" in row[4]:
-            notice_items.append({
-                "company_id": row[2],
-                "company_name": row[3],
-                "params": row[5]["parameters"],
-            })
-    return notice_items
+    notice_items = [row for row in rows if "注意" in row[4]]
 
+    if not notice_items:
+        result = f"{year}/{month}/{day} 無注意清單資料"
+        set_cache(date_key, result)
+        return result
 
-def _analyze_notice_items(
-    session,
-    notice_items: list,
-    skip_company_ids: Optional[set] = None,
-) -> dict[str, str]:
-    """
-    逐一抓明細 + Groq 分析
-    skip_company_ids: 要跳過的公司代號 (早盤 diff 用)
-    回傳 dict: { company_id: block_text }
-    """
-    results = {}
+    blocks = []
     for item in notice_items:
-        cid = item["company_id"]
-        cname = item["company_name"]
-        params = item["params"]
-
-        if skip_company_ids and cid in skip_company_ids:
-            print(f"[Skip] {cid} {cname} (已推播過)")
-            continue
+        company_id = item[2]
+        company_name = item[3]
+        params = item[5]["parameters"]
 
         try:
             detail_resp = session.post(
                 "https://mops.twse.com.tw/mops/api/t05st02_detail",
                 json=params,
+                headers=headers,
             )
             detail = detail_resp.json()
         except Exception as e:
-            print(f"抓取 {cid} 明細失敗: {e}")
+            print(f"抓取 {company_id} 明細失敗: {e}")
             continue
 
         if detail.get("code") != 200:
@@ -359,116 +348,39 @@ def _analyze_notice_items(
 
         for row in detail["result"]["data"]:
             raw_text = row[9]
-            block = analyze_with_groq_single(raw_text, cid, cname)
+            block = analyze_with_groq_single(raw_text, company_id, company_name)
             if block:
-                results[cid] = block
+                blocks.append(block)
 
+        # 避免被 MOPS 封 IP
         time.sleep(2)
-
-    return results
-
-
-def _format_push_message(date_key: str, blocks: dict[str, str], is_delta: bool = False) -> str:
-    """組合推播訊息"""
-    if not blocks:
-        return ""
-
-    tag = "（早盤補充）" if is_delta else ""
-    header = (
-        f"公開資訊觀測站-注意清單{tag}\n"
-        f"查詢日期:{date_key}\n"
-        f"共 {len(blocks)} 筆\n"
-        + "─" * 13
-    )
-    body = ("\n" + "─" * 13 + "\n").join(blocks.values())
-    return f"{header}\n\n{body}"
-
-
-def fetch_eps(year: str, month: str, day: str) -> str:
-    """
-    一般查詢流程 (使用者手動查 / cache 用)
-    有 cache 回 cache,沒 cache 就打 MOPS 抓全部
-    """
-    date_key = f"{year}/{month}/{day}"
-
-    cached = get_cached_result(date_key)
-    if cached:
-        return cached
-
-    session = _create_mops_session()
-    notice_items = _fetch_notice_items(session, year, month, day)
-
-    if notice_items is None:
-        return f"⚠️ 無法解析 {year}/{month}/{day} 的資料"
-
-    if not notice_items:
-        result = f"{year}/{month}/{day} 無注意清單資料"
-        set_cached_result(date_key, result)
-        return result
-
-    blocks = _analyze_notice_items(session, notice_items)
 
     if not blocks:
         result = "⚠️ 無法取得詳細 EPS 資料"
-        set_cached_result(date_key, result)
+        set_cache(date_key, result)
         return result
 
-    result = _format_push_message(date_key, blocks)
+    header = (
+        f"公開資訊觀測站-注意清單\n"
+        f"查詢日期:{year}/{month}/{day}\n"
+        f"共 {len(blocks)} 筆\n"
+        + "─" * 13
+    )
+    body = ("\n" + "─" * 13 + "\n").join(blocks)
+    result = f"{header}\n\n{body}"
 
-    set_cached_result(date_key, result)
-    add_pushed_companies(date_key, list(blocks.keys()))
-
+    set_cache(date_key, result)
     return result
-
-
-def fetch_eps_delta(year: str, month: str, day: str) -> Optional[str]:
-    """
-    差量查詢 (早盤 8:30 專用)
-    重新打 MOPS,跟昨天 17:00 已推播的公司做 diff,只推播新增的
-    回傳: 新增部分的訊息文字,沒有新增回傳 None
-    """
-    date_key = f"{year}/{month}/{day}"
-
-    already_pushed = get_pushed_companies(date_key)
-    print(f"[Delta] {date_key} 已推播過 {len(already_pushed)} 家: {already_pushed}")
-
-    session = _create_mops_session()
-    notice_items = _fetch_notice_items(session, year, month, day)
-
-    if notice_items is None:
-        print(f"[Delta] 無法解析 {date_key} 的資料")
-        return None
-
-    if not notice_items:
-        print(f"[Delta] {date_key} 無注意清單資料")
-        return None
-
-    all_company_ids = {item["company_id"] for item in notice_items}
-    new_company_ids = all_company_ids - already_pushed
-    print(f"[Delta] 全部 {len(all_company_ids)} 家, 新增 {len(new_company_ids)} 家")
-
-    if not new_company_ids:
-        print(f"[Delta] {date_key} 無新增公司,不推播")
-        return None
-
-    # 只分析新增的公司
-    new_blocks = _analyze_notice_items(session, notice_items, skip_company_ids=already_pushed)
-
-    if not new_blocks:
-        print(f"[Delta] 新增公司分析後無有效資料")
-        return None
-
-    # 記錄新增的公司到已推播集合
-    add_pushed_companies(date_key, list(new_blocks.keys()))
-
-   
-    return _format_push_message(date_key, new_blocks, is_delta=True)
 
 
 # ── 交易日工具 ────────────────────────────────
 def get_last_trading_day(now: datetime) -> datetime:
+    """
+    回傳「上一個可能的交易日」(僅處理週末,國定假日由 fetch_eps 回傳的
+    '無資料' 訊息判斷後,由 scheduled_push 繼續往前找)
+    """
     d = now - timedelta(days=1)
-    while d.weekday() >= 5:
+    while d.weekday() >= 5:  # 5=Sat, 6=Sun
         d -= timedelta(days=1)
     return d
 
@@ -479,7 +391,9 @@ def to_roc_ymd(d: datetime) -> tuple[str, str, str]:
 
 # ── LINE 推播輔助 ─────────────────────────────
 def _is_invalid_target_error(e: Exception) -> bool:
+    """判斷是否為使用者封鎖 / ID 失效,這類錯誤應清掉該訂閱者"""
     if isinstance(e, ApiException):
+        # 400 通常是 invalid user id / blocked
         return e.status in (400, 403, 404)
     return False
 
@@ -517,6 +431,7 @@ def send_immediate_reply(token: str, text: str):
 
 # ── 背景任務 ─────────────────────────────────
 def task_fetch_and_push(year: str, month: str, day: str, target_id: str):
+    """背景執行爬蟲,完成後 Push。包 try/except 避免 thread 靜默死亡"""
     print(f"[Task] 背景抓取 {year}/{month}/{day} → {target_id}")
     try:
         result = fetch_eps(year, month, day)
@@ -526,8 +441,54 @@ def task_fetch_and_push(year: str, month: str, day: str, target_id: str):
     push_final_result(target_id, result)
 
 
-# ── 推播到所有訂閱者 ─────────────────────────
-def _push_to_all_users(message: str):
+# ── 排程推播 ─────────────────────────────────
+def scheduled_push(mode: str = 'previous'):
+    """
+    排程推播
+    mode='previous': 推前一交易日(早上 08:30 用,會回推找有資料的交易日)
+    mode='today'   : 推今日資料(下午 17:00 用,不回推)
+    """
+    now_taipei = datetime.now(TZ)
+    print(f"[排程觸發] mode={mode}, 當前台灣時間: {now_taipei}")
+
+    # 週末不推
+    if now_taipei.weekday() >= 5:
+        print(f"[Skip] 今日 {now_taipei.date()} 為週末")
+        return
+
+    if mode == 'today':
+        # 下午盤後:直接抓今天,不回推
+        y, m, d = to_roc_ymd(now_taipei)
+        print(f"[排程-盤後] 查詢今日 {y}/{m}/{d}")
+        message = fetch_eps(y, m, d)
+
+        # 今日無資料就不推(避免騷擾)
+        if "無注意清單資料" in message or "查無資料" in message:
+            print(f"[Info] {y}/{m}/{d} 無注意清單,取消推播")
+            return
+    else:
+        # 早上:推前一交易日,最多回推 7 天(處理連假)
+        target_date = get_last_trading_day(now_taipei)
+        message = None
+        for _ in range(7):
+            y, m, d = to_roc_ymd(target_date)
+            print(f"[排程-早盤] 嘗試查詢 {y}/{m}/{d}")
+            msg = fetch_eps(y, m, d)
+
+            if "無注意清單資料" in msg or "查無資料" in msg:
+                print(f"[排程] {y}/{m}/{d} 無資料,往前一天")
+                target_date -= timedelta(days=1)
+                while target_date.weekday() >= 5:
+                    target_date -= timedelta(days=1)
+                continue
+
+            message = msg
+            break
+
+        if not message:
+            print("[Info] 回推 7 天仍無資料,取消推播")
+            return
+
     users = load_users()
     if not users:
         print("[Info] 目前無訂閱用戶")
@@ -551,62 +512,7 @@ def _push_to_all_users(message: str):
                     remove_user(user_id)
 
 
-# ── 排程推播 ─────────────────────────────────
-def scheduled_push(mode: str = 'previous'):
-    """
-    mode='previous': 早盤 8:30 → 差量推播 (只推昨天 17:00 沒推到的新增公司)
-    mode='today'   : 盤後 17:00 → 全量推播 (抓當日全部注意清單)
-    """
-    now_taipei = datetime.now(TZ)
-    print(f"[排程觸發] mode={mode}, 當前台灣時間: {now_taipei}")
-
-    if now_taipei.weekday() >= 5:
-        print(f"[Skip] 今日 {now_taipei.date()} 為週末")
-        return
-
-    if mode == 'today':
-        # ── 盤後 17:00:全量推播 ──
-        y, m, d = to_roc_ymd(now_taipei)
-        print(f"[排程-盤後] 查詢今日 {y}/{m}/{d}")
-        message = fetch_eps(y, m, d)
-
-        if "無注意清單資料" in message or "查無資料" in message:
-            print(f"[Info] {y}/{m}/{d} 無注意清單,取消推播")
-            return
-
-        _push_to_all_users(message)
-
-    else:
-        # ── 早盤 8:30:差量推播 ──
-        target_date = get_last_trading_day(now_taipei)
-
-        for _ in range(7):
-            y, m, d = to_roc_ymd(target_date)
-            date_key = f"{y}/{m}/{d}"
-            print(f"[排程-早盤] 嘗試差量查詢 {date_key}")
-
-            delta_message = fetch_eps_delta(y, m, d)
-
-            if delta_message is not None:
-                _push_to_all_users(delta_message)
-                return
-
-            # 檢查是否 17:00 已推過 (有紀錄但無新增 → 正常結束)
-            already_pushed = get_pushed_companies(date_key)
-            if already_pushed:
-                print(f"[排程-早盤] {date_key} 已有推播紀錄且無新增,結束")
-                return
-
-            # 該日完全沒資料 → 往前找
-            print(f"[排程-早盤] {date_key} 無資料,往前一天")
-            target_date -= timedelta(days=1)
-            while target_date.weekday() >= 5:
-                target_date -= timedelta(days=1)
-
-        print("[Info] 回推 7 天仍無資料,取消推播")
-
-
-# ── Lifespan ──────────────────────────────────
+# ── Lifespan(必須在 FastAPI 建立前定義)──────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler = BackgroundScheduler(timezone="Asia/Taipei")
@@ -615,6 +521,8 @@ async def lifespan(app: FastAPI):
         day_of_week='mon-fri', hour=8, minute=30,
         id='push_morning'
     )
+
+    # 下午 17:00:推播「今日」自結資訊
     scheduler.add_job(
         scheduled_push, 'cron',
         day_of_week='mon-fri', hour=17, minute=00,
@@ -622,12 +530,13 @@ async def lifespan(app: FastAPI):
         id='push_afternoon'
     )
     scheduler.start()
-    print("✅ Scheduler 已啟動 (平日 08:30 差量推播 / 17:00 全量推播)")
+    print("✅ Scheduler 已啟動 (平日 08:30 推前一日 / 17:00 推今日)")
     yield
     scheduler.shutdown()
     print("🛑 Scheduler 已關閉")
 
 
+# ── FastAPI app(只建立一次!)─────────────────
 app = FastAPI(lifespan=lifespan)
 
 
@@ -665,7 +574,7 @@ def handle_join(event):
                 reply_token=event.reply_token,
                 messages=[TextMsg(type='text', text=(
                     "✅ 已自動訂閱!\n"
-                    "平日早上 8:30 推播前一交易日注意股票的EPS（補充 17:00 後新增）\n"
+                    "平日早上 8:30 推播前一交易日注意股票的EPS\n"
                     "平日下午 17:00 推播當日交易日注意股票的EPS \n"
                     "📋 其他指令:\n"
                     "  今日 → 查今天 EPS 注意清單\n"
@@ -690,6 +599,7 @@ def handle_message(event):
 
     text = event.message.text.strip()
 
+    # 過濾非關鍵字 / 非日期格式,完全不回話
     is_keyword = text in ["訂閱", "取消訂閱", "今日", "today", "指令"]
     is_date_query = bool(re.match(r"^\d{7}$", text))
     if not (is_keyword or is_date_query):
@@ -699,9 +609,7 @@ def handle_message(event):
         save_user(target_id)
         send_immediate_reply(
             event.reply_token,
-            "✅ 已訂閱!\n"
-            "平日早上 8:30 自動推播前一日注意股EPS（補充 17:00 後新增）\n"
-            "平日下午 17:00 自動推播當日注意股EPS"
+            "✅ 已訂閱!平日早上 8:30 自動推播前一日注意股EPS。 \n 平日下午 17:00 自動推播當日注意股EPS"
         )
 
     elif text == "取消訂閱":
@@ -713,7 +621,7 @@ def handle_message(event):
             "📋 指令說明:\n"
             "  今日 → 查今天 EPS 注意清單\n"
             "  1150327 → 查指定日期\n"
-            "  訂閱 → 每天 8:30 / 17:00 自動推播\n"
+            "  訂閱 → 每天 8:30 自動推播\n"
             "  取消訂閱 → 停止推播"
         ))
 
@@ -725,7 +633,7 @@ def handle_message(event):
             y, m, d = text[:3], text[3:5], text[5:7]
 
         date_key = f"{y}/{m}/{d}"
-        cached = get_cached_result(date_key)
+        cached = get_cache(date_key)
         if cached:
             send_immediate_reply(event.reply_token, cached)
         else:
@@ -742,6 +650,10 @@ def handle_message(event):
 
 
 # ── 啟動 ─────────────────────────────────────
+# 開發模式:python main.py (會啟動 ngrok + reload,但 reload=True 會讓
+#           scheduler 跑兩份,因此開發時排程會重複觸發,僅測試用)
+# 正式模式:uvicorn main:app --host 0.0.0.0 --port 8000
+#           (不要開 reload,scheduler 才會只跑一次)
 if __name__ == "__main__":
     from pyngrok import ngrok, conf
     import uvicorn
@@ -749,7 +661,9 @@ if __name__ == "__main__":
     conf.get_default().auth_token = os.environ['NGROK_AUTHTOKEN']
     public_url = ngrok.connect(8000)
     print(f"\n✅ Webhook URL: {public_url}/webhook\n")
+    print("⚠️ 開發模式:reload=True 會造成 scheduler 重複啟動,僅供測試\n")
 
     port = int(os.environ.get("PORT", 8000))
-    # uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False) # 本機
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)  # Render
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False) # 本地
+    fetch_eps('115','04','15')
+    # uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False) # Render
