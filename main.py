@@ -290,6 +290,9 @@ def _create_mops_session():
     return session
 
 
+
+NOTICE_KEYWORDS = ("注意", "證券近期")
+
 def _fetch_notice_items(session, year: str, month: str, day: str) -> Optional[list]:
     """
     從 MOPS 抓取注意清單原始資料
@@ -315,13 +318,17 @@ def _fetch_notice_items(session, year: str, month: str, day: str) -> Optional[li
 
     notice_items = []
     for row in rows:
-        if "注意" in row[4]:
+        if any(kw in row[4] for kw in NOTICE_KEYWORDS):
             notice_items.append({
                 "company_id": row[2],
                 "company_name": row[3],
                 "params": row[5]["parameters"],
             })
     return notice_items
+
+
+
+
 
 
 def _analyze_notice_items(
@@ -753,3 +760,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     # uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False) # 本機
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)  # Render
+
+    
+
