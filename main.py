@@ -430,9 +430,10 @@ def fetch_eps(year: str, month: str, day: str) -> str:
 
 def fetch_eps_delta(year: str, month: str, day: str) -> Optional[str]:
     """
-    差量查詢 (早盤 8:30 專用)
-    重新打 MOPS,跟昨天 17:00 已推播的公司做 diff,只推播新增的
-    回傳: 新增部分的訊息文字,沒有新增回傳 None
+    差量查詢 (早盤 8:30 排程 / diff 指令專用)
+    - 抓該日全部資料，分析後存完整 cache
+    - 與 already_pushed 做 diff，只回傳新增公司訊息
+    - 無新增回傳 None
     """
     date_key = f"{year}/{month}/{day}"
 
@@ -450,25 +451,28 @@ def fetch_eps_delta(year: str, month: str, day: str) -> Optional[str]:
         print(f"[Delta] {date_key} 無注意清單資料")
         return None
 
-    all_company_ids = {item["company_id"] for item in notice_items}
-    new_company_ids = all_company_ids - already_pushed
-    print(f"[Delta] 全部 {len(all_company_ids)} 家, 新增 {len(new_company_ids)} 家")
+    # 分析所有公司
+    all_blocks = _analyze_notice_items(session, notice_items)
 
-    if not new_company_ids:
-        print(f"[Delta] {date_key} 無新增公司,不推播")
+    if not all_blocks:
+        print(f"[Delta] 分析後無有效資料")
         return None
 
-    # 只分析新增的公司
-    new_blocks = _analyze_notice_items(session, notice_items, skip_company_ids=already_pushed)
+    # 存完整 cache（供之後手動查詢直接使用）
+    full_message = _format_push_message(date_key, all_blocks)
+    set_cached_result(date_key, full_message)
+
+    # 計算 diff
+    new_blocks = {k: v for k, v in all_blocks.items() if k not in already_pushed}
+    print(f"[Delta] 全部 {len(all_blocks)} 家, 新增 {len(new_blocks)} 家")
 
     if not new_blocks:
-        print(f"[Delta] 新增公司分析後無有效資料")
+        print(f"[Delta] {date_key} 無新增公司")
         return None
 
     # 記錄新增的公司到已推播集合
     add_pushed_companies(date_key, list(new_blocks.keys()))
 
-   
     return _format_push_message(date_key, new_blocks, is_delta=True)
 
 
@@ -530,6 +534,18 @@ def task_fetch_and_push(year: str, month: str, day: str, target_id: str):
     except Exception as e:
         print(f"[Task] fetch_eps 失敗: {e}")
         result = f"⚠️ 查詢 {year}/{month}/{day} 失敗: {type(e).__name__}"
+    push_final_result(target_id, result)
+
+
+def task_diff_and_push(year: str, month: str, day: str, target_id: str):
+    print(f"[Task-Diff] 背景差量查詢 {year}/{month}/{day} → {target_id}")
+    try:
+        result = fetch_eps_delta(year, month, day)
+        if result is None:
+            result = f"{year}/{month}/{day} 與前次推播相比無新增資料"
+    except Exception as e:
+        print(f"[Task-Diff] fetch_eps_delta 失敗: {e}")
+        result = f"⚠️ 查詢 {year}/{month}/{day} diff 失敗: {type(e).__name__}"
     push_final_result(target_id, result)
 
 
@@ -673,9 +689,10 @@ def handle_join(event):
                 messages=[TextMsg(type='text', text=(
                     "✅ 已自動訂閱!\n"
                     "平日早上 8:30 推播前一交易日注意股票的EPS（補充 17:00 後新增）\n"
-                    "平日下午 17:00 推播當日交易日注意股票的EPS \n"
+                    "平日下午 17:00 推播當日交易日注意股票的EPS\n"
                     "📋 其他指令:\n"
                     "  今日 → 查今天 EPS 注意清單\n"
+                    "  diff → 查前一交易日 17:00 後新增的注意股\n"
                     "  1150327 → 查指定日期\n"
                     "  取消訂閱 → 停止推播"
                 ))]
@@ -697,7 +714,7 @@ def handle_message(event):
 
     text = event.message.text.strip()
 
-    is_keyword = text in ["訂閱", "取消訂閱", "今日", "today", "指令"]
+    is_keyword = text in ["訂閱", "取消訂閱", "今日", "today", "指令", "diff"]
     is_date_query = bool(re.match(r"^\d{7}$", text))
     if not (is_keyword or is_date_query):
         return
@@ -719,10 +736,27 @@ def handle_message(event):
         send_immediate_reply(event.reply_token, (
             "📋 指令說明:\n"
             "  今日 → 查今天 EPS 注意清單\n"
+            "  diff → 查前一交易日 17:00 後新增的注意股\n"
             "  1150327 → 查指定日期\n"
             "  訂閱 → 每天 8:30 / 17:00 自動推播\n"
             "  取消訂閱 → 停止推播"
         ))
+
+    elif text == "diff":
+        now = datetime.now(TZ)
+        target_date = get_last_trading_day(now)
+        y, m, d = to_roc_ymd(target_date)
+        date_key = f"{y}/{m}/{d}"
+        send_immediate_reply(
+            event.reply_token,
+            f"🔍 正在查詢 {date_key} 新增資料，請稍候約 1 分鐘..."
+        )
+        thread = threading.Thread(
+            target=task_diff_and_push,
+            args=(y, m, d, target_id),
+            daemon=True,
+        )
+        thread.start()
 
     elif text in ["今日", "today"] or re.match(r"^\d{7}$", text):
         if text in ["今日", "today"]:
