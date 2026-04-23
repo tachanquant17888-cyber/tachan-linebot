@@ -42,17 +42,17 @@ except Exception as e:
 
 # Redis key 定義
 USERS_KEY = "linebot:users"
-RESULT_KEY_PREFIX = "mops:result:"          # 當日完整訊息 (TTL 24hr)
-COMPANIES_KEY_PREFIX = "mops:companies:"    # 17:00 基準公司代號 SET (TTL 24hr)
+RESULT_KEY_PREFIX = "mops:result:"          # 抓取結果 (TTL 5hr)
+COMPANIES_KEY_PREFIX = "mops:companies:"    # 已推播的公司代號 SET (TTL 24hr)
 
 # Fallback
 _users_fallback: set = set()
 _users_lock = threading.Lock()
 
 
-# ── Redis 讀寫 ────────────────────────────────
-RESULT_TTL_SECONDS = 24 * 60 * 60       # 24 小時
-COMPANIES_TTL_SECONDS = 24 * 60 * 60    # 24 小時
+# ── 結果 Cache (Redis) ────────────────────────
+RESULT_TTL_SECONDS = 5 * 60 * 60       # 5 小時
+COMPANIES_TTL_SECONDS = 24 * 60 * 60   # 24 小時
 
 
 def get_cached_result(date_key: str) -> Optional[str]:
@@ -329,6 +329,8 @@ def _fetch_notice_items(session, year: str, month: str, day: str) -> Optional[li
 
 
 
+
+
 def _analyze_notice_items(
     session,
     notice_items: list,
@@ -336,7 +338,7 @@ def _analyze_notice_items(
 ) -> dict[str, str]:
     """
     逐一抓明細 + Groq 分析
-    skip_company_ids: 要跳過的公司代號 (差量比對用,目前未啟用)
+    skip_company_ids: 要跳過的公司代號 (早盤 diff 用)
     回傳 dict: { company_id: block_text }
     """
     results = {}
@@ -389,18 +391,15 @@ def _format_push_message(date_key: str, blocks: dict[str, str], is_delta: bool =
     return f"{header}\n\n{body}"
 
 
-def fetch_eps(year: str, month: str, day: str, record_pushed: bool = False) -> str:
+def fetch_eps(year: str, month: str, day: str, force_refresh: bool = False) -> str:
     """
-    抓 MOPS 當日注意清單並回傳完整訊息
-
-    record_pushed=False (使用者手動查):
-        先讀 cache,hit 回,miss 抓但不寫 cache / SET
-    record_pushed=True  (17:00 排程):
-        強制抓 MOPS,寫 cache + 寫 baseline SET
+    一般查詢流程 (使用者手動查 / cache 用)
+    有 cache 回 cache,沒 cache 就打 MOPS 抓全部
+    force_refresh=True 時略過 cache,強制重抓 (17:00 排程用)
     """
     date_key = f"{year}/{month}/{day}"
 
-    if not record_pushed:
+    if not force_refresh:
         cached = get_cached_result(date_key)
         if cached:
             return cached
@@ -409,33 +408,31 @@ def fetch_eps(year: str, month: str, day: str, record_pushed: bool = False) -> s
     notice_items = _fetch_notice_items(session, year, month, day)
 
     if notice_items is None:
-        return f"⚠️ 無法解析 {date_key} 的資料"
+        return f"⚠️ 無法解析 {year}/{month}/{day} 的資料"
 
     if not notice_items:
-        result = f"{date_key} 無注意清單資料"
-        if record_pushed:
-            set_cached_result(date_key, result)
+        result = f"{year}/{month}/{day} 無注意清單資料"
+        set_cached_result(date_key, result)
         return result
 
     blocks = _analyze_notice_items(session, notice_items)
 
     if not blocks:
-        return "⚠️ 無法取得詳細 EPS 資料"
+        result = "⚠️ 無法取得詳細 EPS 資料"
+        set_cached_result(date_key, result)
+        return result
 
     result = _format_push_message(date_key, blocks)
 
-    if record_pushed:
-        set_cached_result(date_key, result)
-        add_pushed_companies(date_key, list(blocks.keys()))
+    set_cached_result(date_key, result)
+    add_pushed_companies(date_key, list(blocks.keys()))
 
     return result
 
 
 def fetch_eps_delta(year: str, month: str, day: str) -> tuple[str, Optional[str]]:
     """
-    差量查詢 (早盤 8:30 排程專用)
-    只跟 17:00 寫入的 SET 比對,不更新 SET。
-    成功抓到完整資料時,會用新版覆蓋 cache (讓 08:30 後查昨日可拿到最新完整版)。
+    差量查詢 (早盤 8:30 排程 / diff 指令專用)
 
     回傳 (status, message):
       ("new",     message) 有新增,message 為差量推播訊息
@@ -445,8 +442,8 @@ def fetch_eps_delta(year: str, month: str, day: str) -> tuple[str, Optional[str]
     """
     date_key = f"{year}/{month}/{day}"
 
-    baseline = get_pushed_companies(date_key)
-    print(f"[Delta] {date_key} 17:00 基準 {len(baseline)} 家: {baseline}")
+    already_pushed = get_pushed_companies(date_key)
+    print(f"[Delta] {date_key} 已推播過 {len(already_pushed)} 家: {already_pushed}")
 
     session = _create_mops_session()
     notice_items = _fetch_notice_items(session, year, month, day)
@@ -465,16 +462,17 @@ def fetch_eps_delta(year: str, month: str, day: str) -> tuple[str, Optional[str]
         print(f"[Delta] 分析後無有效資料")
         return ("error", None)
 
-    # 用 08:30 抓到的完整版覆蓋 17:00 的 cache
     full_message = _format_push_message(date_key, all_blocks)
     set_cached_result(date_key, full_message)
 
-    new_blocks = {k: v for k, v in all_blocks.items() if k not in baseline}
-    print(f"[Delta] 全部 {len(all_blocks)} 家, 相對 17:00 新增 {len(new_blocks)} 家")
+    new_blocks = {k: v for k, v in all_blocks.items() if k not in already_pushed}
+    print(f"[Delta] 全部 {len(all_blocks)} 家, 新增 {len(new_blocks)} 家")
 
     if not new_blocks:
         print(f"[Delta] {date_key} 無新增公司")
         return ("no_new", None)
+
+    add_pushed_companies(date_key, list(new_blocks.keys()))
 
     return ("new", _format_push_message(date_key, new_blocks, is_delta=True))
 
@@ -540,6 +538,24 @@ def task_fetch_and_push(year: str, month: str, day: str, target_id: str):
     push_final_result(target_id, result)
 
 
+def task_diff_and_push(year: str, month: str, day: str, target_id: str):
+    print(f"[Task-Diff] 背景差量查詢 {year}/{month}/{day} → {target_id}")
+    try:
+        status, delta_message = fetch_eps_delta(year, month, day)
+        if status == "new":
+            result = delta_message
+        elif status == "no_new":
+            result = f"{year}/{month}/{day} 比對後無更新資料"
+        elif status == "no_data":
+            result = f"{year}/{month}/{day} 無注意清單資料"
+        else:  # error
+            result = "⚠️ MOPS 公開資訊觀測站系統已更換,暫時無法取得資料"
+    except Exception as e:
+        print(f"[Task-Diff] fetch_eps_delta 失敗: {e}")
+        result = f"⚠️ 查詢 {year}/{month}/{day} diff 失敗: {type(e).__name__}"
+    push_final_result(target_id, result)
+
+
 # ── 推播到所有訂閱者 ─────────────────────────
 def _push_to_all_users(message: str):
     users = load_users()
@@ -581,8 +597,8 @@ def scheduled_push(mode: str = 'previous'):
     if mode == 'today':
         # ── 盤後 17:00:全量推播 ──
         y, m, d = to_roc_ymd(now_taipei)
-        print(f"[排程-盤後] 查詢今日 {y}/{m}/{d}")
-        message = fetch_eps(y, m, d, record_pushed=True)
+        print(f"[排程-盤後] 查詢今日 {y}/{m}/{d} (強制重抓)")
+        message = fetch_eps(y, m, d, force_refresh=True)
 
         if "無注意清單資料" in message or "查無資料" in message:
             print(f"[Info] {y}/{m}/{d} 無注意清單,取消推播")
@@ -675,6 +691,7 @@ def handle_join(event):
                     "平日下午 17:00 推播當日交易日注意股票的EPS\n"
                     "📋 其他指令:\n"
                     "  今日 → 查今天 EPS 注意清單\n"
+                    "  diff → 查前一交易日 17:00 後新增的注意股\n"
                     "  1150327 → 查指定日期\n"
                     "  取消訂閱 → 停止推播"
                 ))]
@@ -696,7 +713,7 @@ def handle_message(event):
 
     text = event.message.text.strip()
 
-    is_keyword = text in ["訂閱", "取消訂閱", "今日", "today", "指令"]
+    is_keyword = text in ["訂閱", "取消訂閱", "今日", "today", "指令", "diff"]
     is_date_query = bool(re.match(r"^\d{7}$", text))
     if not (is_keyword or is_date_query):
         return
@@ -718,10 +735,27 @@ def handle_message(event):
         send_immediate_reply(event.reply_token, (
             "📋 指令說明:\n"
             "  今日 → 查今天 EPS 注意清單\n"
+            "  diff → 查前一交易日 17:00 後新增的注意股\n"
             "  1150327 → 查指定日期\n"
             "  訂閱 → 每天 8:30 / 17:00 自動推播\n"
             "  取消訂閱 → 停止推播"
         ))
+
+    elif text == "diff":
+        now = datetime.now(TZ)
+        target_date = get_last_trading_day(now)
+        y, m, d = to_roc_ymd(target_date)
+        date_key = f"{y}/{m}/{d}"
+        send_immediate_reply(
+            event.reply_token,
+            f"🔍 正在查詢 {date_key} 新增資料，請稍候約 1 分鐘..."
+        )
+        thread = threading.Thread(
+            target=task_diff_and_push,
+            args=(y, m, d, target_id),
+            daemon=True,
+        )
+        thread.start()
 
     elif text in ["今日", "today"] or re.match(r"^\d{7}$", text):
         if text in ["今日", "today"]:
@@ -758,4 +792,7 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 8000))
     # uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False) # 本機
-    uvicorn.run("main_v1:app", host="0.0.0.0", port=port, reload=False)  # Render
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)  # Render
+
+    
+
