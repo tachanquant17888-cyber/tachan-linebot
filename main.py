@@ -423,7 +423,7 @@ def fetch_eps(year: str, month: str, day: str) -> str:
     result = _format_push_message(date_key, blocks)
 
     set_cached_result(date_key, result)
-    # add_pushed_companies(date_key, list(blocks.keys()))
+    add_pushed_companies(date_key, list(blocks.keys()))
 
     return result
 
