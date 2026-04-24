@@ -544,6 +544,32 @@ def task_fetch_and_push(year: str, month: str, day: str, target_id: str):
     push_final_result(target_id, result)
 
 
+# ── 手動 diff:只回給觸發者,不廣播 ───────────
+def _run_diff_reply(target_id: str):
+    now_taipei = datetime.now(TZ)
+    if now_taipei.weekday() >= 5:
+        push_final_result(target_id, "今日為週末,無排程資料")
+        return
+
+    target_date = get_last_trading_day(now_taipei)
+    y, m, d = to_roc_ymd(target_date)
+    date_key = f"{y}/{m}/{d}"
+
+    status, delta_message = fetch_eps_delta(y, m, d)
+
+    if status == "new":
+        push_final_result(target_id, delta_message)
+    elif status == "no_new":
+        push_final_result(target_id, f"{date_key} 比對後無更新資料")
+    elif status == "no_data":
+        push_final_result(target_id, f"{date_key} 無注意清單資料")
+    else:
+        push_final_result(
+            target_id,
+            "⚠️ MOPS 公開資訊觀測站系統已更換,暫時無法取得資料"
+        )
+
+
 # ── 推播到所有訂閱者 ─────────────────────────
 def _push_to_all_users(message: str):
     users = load_users()
@@ -708,8 +734,12 @@ def handle_message(event):
     if text == "diff":
         if user_id not in ADMIN_USER_IDS:
             return
-        send_immediate_reply(event.reply_token, "🔍 手動觸發差量推播中...")
-        threading.Thread(target=scheduled_push, daemon=True).start()
+        send_immediate_reply(event.reply_token, "🔍 手動差量查詢中...")
+        threading.Thread(
+            target=_run_diff_reply,
+            args=(target_id,),
+            daemon=True,
+        ).start()
         return
 
     if text == "訂閱":

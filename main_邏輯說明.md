@@ -33,9 +33,10 @@ LINE Bot,平日自動推播 MOPS (公開資訊觀測站) 的「注意清單」EP
 |-----|-----------------|-------------------|
 | 17:00 排程 | ✓ 寫入 (當日完整訊息) | ✓ 寫入 (當日公司 SET,baseline) |
 | 08:30 排程 | ✓ 覆蓋 (08:30 完整版) | ✗ 不動 |
+| 管理員 `diff` (手動) | ✓ 覆蓋 (即時完整版) | ✗ 不動 |
 | 使用者查「今日/日期」 | ✓ **讀** (hit 直接回,miss 抓但不寫) | ✗ |
 
-重點:**SET 只有 17:00 會寫**,08:30 排程只讀不寫。沒有其他路徑會動 SET,baseline 絕對不漂移。
+重點:**SET 只有 17:00 會寫**,08:30 排程與管理員 `diff` 皆只讀不寫。沒有其他路徑會動 SET,baseline 絕對不漂移。
 
 ---
 
@@ -90,12 +91,15 @@ LINE Bot,平日自動推播 MOPS (公開資訊觀測站) 的「注意清單」EP
 ### G. 背景任務
 
 - `task_fetch_and_push` — 使用者「今日 / 日期查詢」的背景執行
+- `_run_diff_reply` — 管理員手動 `diff` 的背景執行(只回觸發的對話,**不廣播**)
 
 ### H. 排程
 
 `scheduled_push(mode)`:
-- `mode='previous'` (08:30) → 差量推播
-- `mode='today'` (17:00) → 全量推播
+- `mode='previous'` (08:30) → 差量推播(廣播)
+- `mode='today'` (17:00) → 全量推播(廣播)
+
+手動 `diff` 不走 `scheduled_push`,改走 `_run_diff_reply`,邏輯一致但只推給觸發者所在對話。
 
 ---
 
@@ -145,8 +149,26 @@ APScheduler 觸發 (mon-fri 08:30)
 | `指令` | 回使用說明 |
 | `今日` / `today` | 查今天 (有 cache 直接回,否則背景跑 `task_fetch_and_push`) |
 | 7 碼數字 (如 `1150423`) | 查指定日期 (同上,走 cache) |
+| `diff` | **管理員限定**,對上一交易日做差量查詢,結果只回觸發的對話(個人/群組),不廣播 |
 
 **cache miss 的手動查詢**:走 `fetch_eps(record_pushed=False)`,**不寫** cache / SET,下一位使用者查同一天還是會再打一次 MOPS。
+
+### 4.4 管理員手動 `diff`
+
+```
+管理員在任一對話打 "diff"
+ → 檢查 event.source.user_id 是否在 ADMIN_USER_IDS
+   (群組/個人一視同仁,target_id 決定回到哪個對話)
+ → 回覆 "🔍 手動差量查詢中..."
+ → 背景執行 _run_diff_reply(target_id)
+   → 週末 → 回「今日為週末,無排程資料」
+   → 平日 → fetch_eps_delta(上一交易日)
+     → 讀 baseline / 抓 MOPS / 覆蓋 cache(同 08:30 邏輯)
+     → SET 不動
+   → push_final_result(target_id, ...)   ← 只推觸發者對話
+```
+
+與 08:30 排程的差異:只改推播對象(單一 target vs. 全體訂閱者),其餘副作用(覆蓋 cache、不動 SET)完全相同。
 
 ---
 
@@ -154,12 +176,12 @@ APScheduler 觸發 (mon-fri 08:30)
 
 ### 5.1 為什麼 SET 只有 17:00 寫?
 
-因為沒有對使用者開放的 `diff` 指令,每個 date_key 的 SET 生命週期很單純:
+雖然管理員有 `diff` 指令,但設計上 `diff` 與 08:30 排程**都不更新 SET**,每個 date_key 的 SET 生命週期仍很單純:
 - 17:00 寫入一次 (TTL 24hr)
-- 隔天 08:30 讀取一次
+- 隔天 08:30 / 管理員 `diff` 讀取一次或多次
 - 用完就自然過期 (或被隔天 17:00 同 date_key 蓋掉)
 
-沒有其他路徑會碰 SET,baseline 是絕對純淨的 17:00 snapshot,`fetch_eps_delta` 的結果永遠穩定。
+baseline 是絕對純淨的 17:00 snapshot,`fetch_eps_delta` 的結果永遠穩定。副作用是:管理員在 08:30 前手動 `diff` 過之後,正式 08:30 排程仍會再算一次差量,若期間 MOPS 無新增公司則訂閱者會收到與管理員預覽相同的訊息(管理員 `diff` 只回自己,不影響其他訂閱者收到的 08:30 推播內容)。
 
 ### 5.2 為什麼 cache STRING 會被 08:30 覆蓋?
 
