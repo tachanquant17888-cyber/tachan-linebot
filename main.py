@@ -30,6 +30,10 @@ configuration = Configuration(access_token=os.environ['LINE_CHANNEL_ACCESS_TOKEN
 handler = WebhookHandler(os.environ['LINE_CHANNEL_SECRET'])
 groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
+ADMIN_USER_IDS = {
+    uid.strip() for uid in os.environ.get("ADMIN_USER_IDS", "").split(",") if uid.strip()
+}
+
 TZ = ZoneInfo("Asia/Taipei")
 
 # ── Upstash Redis ─────────────────────────────
@@ -696,9 +700,16 @@ def handle_message(event):
 
     text = event.message.text.strip()
 
-    is_keyword = text in ["訂閱", "取消訂閱", "今日", "today", "指令"]
+    is_keyword = text in ["訂閱", "取消訂閱", "今日", "today", "指令", "diff"]
     is_date_query = bool(re.match(r"^\d{7}$", text))
     if not (is_keyword or is_date_query):
+        return
+
+    if text == "diff":
+        if user_id not in ADMIN_USER_IDS:
+            return
+        send_immediate_reply(event.reply_token, "🔍 手動觸發差量推播中...")
+        threading.Thread(target=scheduled_push, daemon=True).start()
         return
 
     if text == "訂閱":
