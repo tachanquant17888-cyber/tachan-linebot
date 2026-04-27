@@ -734,12 +734,31 @@ def handle_message(event):
     if text == "diff":
         if user_id not in ADMIN_USER_IDS:
             return
-        send_immediate_reply(event.reply_token, "🔍 手動差量查詢中...")
-        threading.Thread(
-            target=_run_diff_reply,
-            args=(target_id,),
-            daemon=True,
-        ).start()
+        # ── 原始做法：背景查詢 + push_message（計月配額）── 下個月初改回來
+        # send_immediate_reply(event.reply_token, "🔍 手動差量查詢中...")
+        # threading.Thread(
+        #     target=_run_diff_reply,
+        #     args=(target_id,),
+        #     daemon=True,
+        # ).start()
+
+        # ── 替代做法：同步查詢 + reply_message（不計配額，但需等待）──
+        now_taipei = datetime.now(TZ)
+        if now_taipei.weekday() >= 5:
+            send_immediate_reply(event.reply_token, "今日為週末,無排程資料")
+        else:
+            target_date = get_last_trading_day(now_taipei)
+            y, m, d = to_roc_ymd(target_date)
+            date_key = f"{y}/{m}/{d}"
+            status, delta_message = fetch_eps_delta(y, m, d)
+            if status == "new":
+                send_immediate_reply(event.reply_token, delta_message)
+            elif status == "no_new":
+                send_immediate_reply(event.reply_token, f"{date_key} 比對後無更新資料")
+            elif status == "no_data":
+                send_immediate_reply(event.reply_token, f"{date_key} 無注意清單資料")
+            else:
+                send_immediate_reply(event.reply_token, "⚠️ MOPS 公開資訊觀測站系統已更換,暫時無法取得資料")
         return
 
     if text == "訂閱":
@@ -776,16 +795,21 @@ def handle_message(event):
         if cached:
             send_immediate_reply(event.reply_token, cached)
         else:
-            send_immediate_reply(
-                event.reply_token,
-                f"🔍 正在查詢 {date_key} 資料,請稍候約 1 分鐘..."
-            )
-            thread = threading.Thread(
-                target=task_fetch_and_push,
-                args=(y, m, d, target_id),
-                daemon=True,
-            )
-            thread.start()
+            # ── 原始做法：背景查詢 + push_message（計月配額）── 下個月初改回來
+            # send_immediate_reply(
+            #     event.reply_token,
+            #     f"🔍 正在查詢 {date_key} 資料,請稍候約 1 分鐘..."
+            # )
+            # thread = threading.Thread(
+            #     target=task_fetch_and_push,
+            #     args=(y, m, d, target_id),
+            #     daemon=True,
+            # )
+            # thread.start()
+
+            # ── 替代做法：同步查詢 + reply_message（不計配額，但需等待）──
+            result = fetch_eps(y, m, d)
+            send_immediate_reply(event.reply_token, result)
 
 
 # ── 啟動 ─────────────────────────────────────
