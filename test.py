@@ -10,8 +10,8 @@ def fetch_EPS():
     session = requests.Session()
     session.verify = False
     year = 115
-    month=4
-    day=15
+    month=5
+    day=5
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         "Origin": "https://mops.twse.com.tw",

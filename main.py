@@ -307,14 +307,26 @@ def _fetch_notice_items(session, year: str, month: str, day: str) -> Optional[li
         json={"year": year, "month": month, "day": day},
     )
 
+    print(f"[MOPS] HTTP {response.status_code}, body長度: {len(response.text)}")
+
+    if not response.text.strip():
+        print(f"[MOPS] 回應為空，MOPS 可能暫時無回應")
+        return []
+
     try:
         data = response.json()
         print(f"response : {data}")
         if not data or "result" not in data or data["result"] is None:
             return []
-        rows = data["result"].get("data", [])
-    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        result_val = data["result"]
+        if not isinstance(result_val, dict):
+            print(f"[MOPS] result 型態異常: {type(result_val)} → {result_val}")
+            return []
+        rows = result_val.get("data", [])
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
         print(f"解析 MOPS 資料時發生錯誤: {e}")
+        print(f"[MOPS] 原始 HTTP 狀態碼: {response.status_code}")
+        print(f"[MOPS] 原始回應內容(前500字): {response.text[:500]}")
         return None
 
     if not rows:
