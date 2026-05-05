@@ -289,6 +289,7 @@ def _create_mops_session():
         "Origin": "https://mops.twse.com.tw",
         "Referer": "https://mops.twse.com.tw/mops/web/t05st02",
         "content-type": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
     })
     session.get("https://mops.twse.com.tw/mops/web/t05st02")
     return session
