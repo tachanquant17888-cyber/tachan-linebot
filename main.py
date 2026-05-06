@@ -30,10 +30,6 @@ configuration = Configuration(access_token=os.environ['LINE_CHANNEL_ACCESS_TOKEN
 handler = WebhookHandler(os.environ['LINE_CHANNEL_SECRET'])
 groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-ADMIN_USER_IDS = {
-    uid.strip() for uid in os.environ.get("ADMIN_USER_IDS", "").split(",") if uid.strip()
-}
-
 TZ = ZoneInfo("Asia/Taipei")
 
 # ── Upstash Redis ─────────────────────────────
@@ -46,8 +42,7 @@ except Exception as e:
 
 # Redis key 定義
 USERS_KEY = "linebot:users"
-RESULT_KEY_PREFIX = "mops:result:"          # 當日完整訊息 (TTL 24hr)
-COMPANIES_KEY_PREFIX = "mops:companies:"    # 17:00 基準公司代號 SET (TTL 24hr)
+RESULT_KEY_PREFIX = "mops:result:"          # 完整訊息 (TTL 24hr)
 
 # Fallback
 _users_fallback: set = set()
@@ -56,7 +51,6 @@ _users_lock = threading.Lock()
 
 # ── Redis 讀寫 ────────────────────────────────
 RESULT_TTL_SECONDS = 24 * 60 * 60       # 24 小時
-COMPANIES_TTL_SECONDS = 24 * 60 * 60    # 24 小時
 
 
 def get_cached_result(date_key: str) -> Optional[str]:
@@ -84,32 +78,6 @@ def set_cached_result(date_key: str, result: str):
         print(f"[Redis SET] {date_key} (TTL {RESULT_TTL_SECONDS}s)")
     except Exception as e:
         print(f"[Redis] set_cached_result 失敗: {e}")
-
-
-def get_pushed_companies(date_key: str) -> set:
-    """取得該日期已推播過的公司代號集合"""
-    if redis_client is None:
-        return set()
-    try:
-        key = f"{COMPANIES_KEY_PREFIX}{date_key}"
-        members = redis_client.smembers(key)
-        return set(members) if members else set()
-    except Exception as e:
-        print(f"[Redis] get_pushed_companies 失敗: {e}")
-        return set()
-
-
-def add_pushed_companies(date_key: str, company_ids: list[str]):
-    """把公司代號加入已推播集合 (Redis SET, TTL 24hr)"""
-    if redis_client is None or not company_ids:
-        return
-    try:
-        key = f"{COMPANIES_KEY_PREFIX}{date_key}"
-        redis_client.sadd(key, *company_ids)
-        redis_client.expire(key, COMPANIES_TTL_SECONDS)
-        print(f"[Redis] 已記錄 {len(company_ids)} 家公司至 {key}")
-    except Exception as e:
-        print(f"[Redis] add_pushed_companies 失敗: {e}")
 
 
 # ── 訂閱名單管理 ──────────────────────────────
@@ -346,25 +314,13 @@ def _fetch_notice_items(session, year: str, month: str, day: str) -> Optional[li
 
 
 
-def _analyze_notice_items(
-    session,
-    notice_items: list,
-    skip_company_ids: Optional[set] = None,
-) -> dict[str, str]:
-    """
-    逐一抓明細 + Groq 分析
-    skip_company_ids: 要跳過的公司代號 (差量比對用,目前未啟用)
-    回傳 dict: { company_id: block_text }
-    """
+def _analyze_notice_items(session, notice_items: list) -> dict[str, str]:
+    """逐一抓明細 + Groq 分析,回傳 dict: { company_id: block_text }"""
     results = {}
     for item in notice_items:
         cid = item["company_id"]
         cname = item["company_name"]
         params = item["params"]
-
-        if skip_company_ids and cid in skip_company_ids:
-            print(f"[Skip] {cid} {cname} (已推播過)")
-            continue
 
         try:
             detail_resp = session.post(
@@ -390,14 +346,13 @@ def _analyze_notice_items(
     return results
 
 
-def _format_push_message(date_key: str, blocks: dict[str, str], is_delta: bool = False) -> str:
+def _format_push_message(date_key: str, blocks: dict[str, str]) -> str:
     """組合推播訊息"""
     if not blocks:
         return ""
 
-    tag = "（早盤補充）" if is_delta else ""
     header = (
-        f"公開資訊觀測站-注意清單{tag}\n"
+        f"公開資訊觀測站-注意清單\n"
         f"查詢日期:{date_key}\n"
         f"共 {len(blocks)} 筆\n"
         + "─" * 13
@@ -406,21 +361,13 @@ def _format_push_message(date_key: str, blocks: dict[str, str], is_delta: bool =
     return f"{header}\n\n{body}"
 
 
-def fetch_eps(year: str, month: str, day: str, record_pushed: bool = False) -> str:
-    """
-    抓 MOPS 當日注意清單並回傳完整訊息
-
-    record_pushed=False (使用者手動查):
-        先讀 cache,hit 回,miss 抓但不寫 cache / SET
-    record_pushed=True  (17:00 排程):
-        強制抓 MOPS,寫 cache + 寫 baseline SET
-    """
+def fetch_eps(year: str, month: str, day: str) -> str:
+    """抓 MOPS 注意清單並回傳完整訊息,有 cache 先回 cache,否則抓 MOPS 後寫入 cache"""
     date_key = f"{year}/{month}/{day}"
 
-    if not record_pushed:
-        cached = get_cached_result(date_key)
-        if cached:
-            return cached
+    cached = get_cached_result(date_key)
+    if cached:
+        return cached
 
     session = _create_mops_session()
     notice_items = _fetch_notice_items(session, year, month, day)
@@ -430,8 +377,7 @@ def fetch_eps(year: str, month: str, day: str, record_pushed: bool = False) -> s
 
     if not notice_items:
         result = f"{date_key} 無注意清單資料"
-        if record_pushed:
-            set_cached_result(date_key, result)
+        set_cached_result(date_key, result)
         return result
 
     blocks = _analyze_notice_items(session, notice_items)
@@ -440,60 +386,8 @@ def fetch_eps(year: str, month: str, day: str, record_pushed: bool = False) -> s
         return "⚠️ 無法取得詳細 EPS 資料"
 
     result = _format_push_message(date_key, blocks)
-
-    if record_pushed:
-        set_cached_result(date_key, result)
-        add_pushed_companies(date_key, list(blocks.keys()))
-
+    set_cached_result(date_key, result)
     return result
-
-
-def fetch_eps_delta(year: str, month: str, day: str) -> tuple[str, Optional[str]]:
-    """
-    差量查詢 (早盤 8:30 排程專用)
-    只跟 17:00 寫入的 SET 比對,不更新 SET。
-    成功抓到完整資料時,會用新版覆蓋 cache (讓 08:30 後查昨日可拿到最新完整版)。
-
-    回傳 (status, message):
-      ("new",     message) 有新增,message 為差量推播訊息
-      ("no_new",  None)    有資料但無新增
-      ("no_data", None)    該日 MOPS 無注意清單
-      ("error",   None)    MOPS 解析或擷取失敗
-    """
-    date_key = f"{year}/{month}/{day}"
-
-    baseline = get_pushed_companies(date_key)
-    print(f"[Delta] {date_key} 17:00 基準 {len(baseline)} 家: {baseline}")
-
-    session = _create_mops_session()
-    notice_items = _fetch_notice_items(session, year, month, day)
-
-    if notice_items is None:
-        print(f"[Delta] 無法解析 {date_key} 的資料")
-        return ("error", None)
-
-    if not notice_items:
-        print(f"[Delta] {date_key} 無注意清單資料")
-        return ("no_data", None)
-
-    all_blocks = _analyze_notice_items(session, notice_items)
-
-    if not all_blocks:
-        print(f"[Delta] 分析後無有效資料")
-        return ("error", None)
-
-    # 用 08:30 抓到的完整版覆蓋 17:00 的 cache
-    full_message = _format_push_message(date_key, all_blocks)
-    set_cached_result(date_key, full_message)
-
-    new_blocks = {k: v for k, v in all_blocks.items() if k not in baseline}
-    print(f"[Delta] 全部 {len(all_blocks)} 家, 相對 17:00 新增 {len(new_blocks)} 家")
-
-    if not new_blocks:
-        print(f"[Delta] {date_key} 無新增公司")
-        return ("no_new", None)
-
-    return ("new", _format_push_message(date_key, new_blocks, is_delta=True))
 
 
 # ── 交易日工具 ────────────────────────────────
@@ -557,32 +451,6 @@ def task_fetch_and_push(year: str, month: str, day: str, target_id: str):
     push_final_result(target_id, result)
 
 
-# ── 手動 diff:只回給觸發者,不廣播 ───────────
-def _run_diff_reply(target_id: str):
-    now_taipei = datetime.now(TZ)
-    if now_taipei.weekday() >= 5:
-        push_final_result(target_id, "今日為週末,無排程資料")
-        return
-
-    target_date = get_last_trading_day(now_taipei)
-    y, m, d = to_roc_ymd(target_date)
-    date_key = f"{y}/{m}/{d}"
-
-    status, delta_message = fetch_eps_delta(y, m, d)
-
-    if status == "new":
-        push_final_result(target_id, delta_message)
-    elif status == "no_new":
-        push_final_result(target_id, f"{date_key} 比對後無更新資料")
-    elif status == "no_data":
-        push_final_result(target_id, f"{date_key} 無注意清單資料")
-    else:
-        push_final_result(
-            target_id,
-            "⚠️ MOPS 公開資訊觀測站系統已更換,暫時無法取得資料"
-        )
-
-
 # ── 推播到所有訂閱者 ─────────────────────────
 def _push_to_all_users(message: str):
     users = load_users()
@@ -609,50 +477,23 @@ def _push_to_all_users(message: str):
 
 
 # ── 排程推播 ─────────────────────────────────
-def scheduled_push(mode: str = 'previous'):
-    """
-    mode='previous': 早盤 8:30 → 差量推播 (只推昨天 17:00 沒推到的新增公司)
-    mode='today'   : 盤後 17:00 → 全量推播 (抓當日全部注意清單)
-    """
+def scheduled_push():
+    """每日 07:30 抓前一交易日注意清單,寫入 cache 並推播給所有訂閱者"""
     now_taipei = datetime.now(TZ)
-    print(f"[排程觸發] mode={mode}, 當前台灣時間: {now_taipei}")
+    print(f"[排程觸發] 當前台灣時間: {now_taipei}")
 
-    if now_taipei.weekday() >= 5:
-        print(f"[Skip] 今日 {now_taipei.date()} 為週末")
+    target_date = get_last_trading_day(now_taipei)
+    y, m, d = to_roc_ymd(target_date)
+    date_key = f"{y}/{m}/{d}"
+    print(f"[排程] 查詢前一交易日 {date_key}")
+
+    message = fetch_eps(y, m, d)
+
+    if "無注意清單資料" in message or "查無資料" in message:
+        print(f"[Info] {date_key} 無注意清單,取消推播")
         return
 
-    if mode == 'today':
-        # ── 盤後 17:00:全量推播 ──
-        y, m, d = to_roc_ymd(now_taipei)
-        print(f"[排程-盤後] 查詢今日 {y}/{m}/{d}")
-        message = fetch_eps(y, m, d, record_pushed=True)
-
-        if "無注意清單資料" in message or "查無資料" in message:
-            print(f"[Info] {y}/{m}/{d} 無注意清單,取消推播")
-            return
-
-        _push_to_all_users(message)
-
-    else:
-        # ── 早盤 8:30:差量推播 ──
-        # get_last_trading_day 已處理週末 (週一→週五)
-        target_date = get_last_trading_day(now_taipei)
-        y, m, d = to_roc_ymd(target_date)
-        date_key = f"{y}/{m}/{d}"
-        print(f"[排程-早盤] 差量查詢 {date_key}")
-
-        status, delta_message = fetch_eps_delta(y, m, d)
-
-        if status == "new":
-            _push_to_all_users(delta_message)
-        elif status == "no_new":
-            _push_to_all_users(f"{date_key} 比對後無更新資料")
-        elif status == "no_data":
-            _push_to_all_users(f"{date_key} 無注意清單資料")
-        else:  # error
-            _push_to_all_users(
-                "⚠️ MOPS 公開資訊觀測站系統已更換,暫時無法取得今日資料"
-            )
+    _push_to_all_users(message)
 
 
 # ── Lifespan ──────────────────────────────────
@@ -661,17 +502,11 @@ async def lifespan(app: FastAPI):
     scheduler = BackgroundScheduler(timezone="Asia/Taipei")
     scheduler.add_job(
         scheduled_push, 'cron',
-        day_of_week='mon-fri', hour=8, minute=30,
+        day_of_week='tue-sat', hour=7, minute=30,
         id='push_morning'
     )
-    scheduler.add_job(
-        scheduled_push, 'cron',
-        day_of_week='mon-fri', hour=17, minute=00,
-        args=['today'],
-        id='push_afternoon'
-    )
     scheduler.start()
-    print("✅ Scheduler 已啟動 (平日 08:30 差量推播 / 17:00 全量推播)")
+    print("✅ Scheduler 已啟動 (每日 07:30 推播前一交易日注意清單)")
     yield
     scheduler.shutdown()
     print("🛑 Scheduler 已關閉")
@@ -714,8 +549,7 @@ def handle_join(event):
                 reply_token=event.reply_token,
                 messages=[TextMsg(type='text', text=(
                     "✅ 已自動訂閱!\n"
-                    "平日早上 8:30 推播前一交易日注意股票的EPS（補充 17:00 後新增）\n"
-                    "平日下午 17:00 推播當日交易日注意股票的EPS\n"
+                    "每日早上 7:30 推播前一交易日注意股票的EPS\n"
                     "📋 其他指令:\n"
                     "  今日 → 查今天 EPS 注意清單\n"
                     "  1150327 → 查指定日期\n"
@@ -739,39 +573,9 @@ def handle_message(event):
 
     text = event.message.text.strip()
 
-    is_keyword = text in ["訂閱", "取消訂閱", "今日", "today", "指令", "diff"]
+    is_keyword = text in ["訂閱", "取消訂閱", "今日", "today", "指令"]
     is_date_query = bool(re.match(r"^\d{7}$", text))
     if not (is_keyword or is_date_query):
-        return
-
-    if text == "diff":
-        if user_id not in ADMIN_USER_IDS:
-            return
-        # ── 原始做法：背景查詢 + push_message（計月配額）── 下個月初改回來
-        # send_immediate_reply(event.reply_token, "🔍 手動差量查詢中...")
-        # threading.Thread(
-        #     target=_run_diff_reply,
-        #     args=(target_id,),
-        #     daemon=True,
-        # ).start()
-
-        # ── 替代做法：同步查詢 + reply_message（不計配額，但需等待）──
-        now_taipei = datetime.now(TZ)
-        if now_taipei.weekday() >= 5:
-            send_immediate_reply(event.reply_token, "今日為週末,無排程資料")
-        else:
-            target_date = get_last_trading_day(now_taipei)
-            y, m, d = to_roc_ymd(target_date)
-            date_key = f"{y}/{m}/{d}"
-            status, delta_message = fetch_eps_delta(y, m, d)
-            if status == "new":
-                send_immediate_reply(event.reply_token, delta_message)
-            elif status == "no_new":
-                send_immediate_reply(event.reply_token, f"{date_key} 比對後無更新資料")
-            elif status == "no_data":
-                send_immediate_reply(event.reply_token, f"{date_key} 無注意清單資料")
-            else:
-                send_immediate_reply(event.reply_token, "⚠️ MOPS 公開資訊觀測站系統已更換,暫時無法取得資料")
         return
 
     if text == "訂閱":
@@ -779,8 +583,7 @@ def handle_message(event):
         send_immediate_reply(
             event.reply_token,
             "✅ 已訂閱!\n"
-            "平日早上 8:30 自動推播前一日注意股EPS（補充 17:00 後新增）\n"
-            "平日下午 17:00 自動推播當日注意股EPS"
+            "每日早上 7:30 自動推播前一交易日注意股EPS"
         )
 
     elif text == "取消訂閱":
@@ -792,7 +595,7 @@ def handle_message(event):
             "📋 指令說明:\n"
             "  今日 → 查今天 EPS 注意清單\n"
             "  1150327 → 查指定日期\n"
-            "  訂閱 → 每天 8:30 / 17:00 自動推播\n"
+            "  訂閱 → 每天 7:30 自動推播\n"
             "  取消訂閱 → 停止推播"
         ))
 
