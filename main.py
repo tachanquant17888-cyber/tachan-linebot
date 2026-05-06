@@ -523,6 +523,15 @@ def health_check():
     return {"status": "ok"}
 
 
+@app.get("/myip")
+def myip():
+    try:
+        ip = requests.get("https://api.ipify.org", timeout=5).text
+        return {"outbound_ip": ip}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.post("/webhook")
 async def webhook(request: Request, x_line_signature: str = Header(...)):
     body = await request.body()
@@ -636,9 +645,8 @@ def handle_message(event):
 # ── 啟動 ─────────────────────────────────────
 if __name__ == "__main__":
     from pyngrok import ngrok, conf
-    import uvicorn
-    import requests, logging                                                                                                                                                                                
-    logging.info(f"Outbound IP: {requests.get('https://api.ipify.org').text}")
+    import uvicorn                                                                                                                                                                      
+   
 
     conf.get_default().auth_token = os.environ['NGROK_AUTHTOKEN']
     public_url = ngrok.connect(8000)
