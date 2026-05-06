@@ -23,6 +23,9 @@ import os
 import threading
 from upstash_redis import Redis
 
+
+
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
@@ -628,10 +631,14 @@ def handle_message(event):
             send_immediate_reply(event.reply_token, result)
 
 
+
+
 # ── 啟動 ─────────────────────────────────────
 if __name__ == "__main__":
     from pyngrok import ngrok, conf
     import uvicorn
+    import requests, logging                                                                                                                                                                                
+    logging.info(f"Outbound IP: {requests.get('https://api.ipify.org').text}")
 
     conf.get_default().auth_token = os.environ['NGROK_AUTHTOKEN']
     public_url = ngrok.connect(8000)
