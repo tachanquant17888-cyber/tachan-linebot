@@ -205,7 +205,7 @@ def analyze_with_groq_single(raw_text: str, company_id: str, company_name: str) 
 
 欄位對應規則(重要):
 - 表格通常有「最近一月」或「近一月」和「最近一季」或「最近一期」或「近一季」兩欄數字
-- 「每股盈餘」或「EPS」或 「稅後盈餘」或 「每股淨利」或「稅前盈餘」[那列 → 取出 latest_month_eps 和 latest_quarter_eps
+- 「每股盈餘」或「EPS」或 「稅後盈餘」或 「每股淨利」或「稅前盈餘」或 「稅前EPS」那列 → 取出 latest_month_eps 和 latest_quarter_eps
 - 「營業收入」那列 → 取出 latest_month_revenue 和 latest_quarter_revenue(單位:百萬)
 - is_bond: 若含「公司債」或「可轉債」填 true,其餘填false
 - EPS跟每股盈餘如果是虧損請填負數,如 (0.19) → -0.19
