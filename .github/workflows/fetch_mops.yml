@@ -18,24 +18,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Debug Redis connection
-        env:
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-        run: |
-          python - <<'EOF'
-          import os
-          url = os.environ.get("UPSTASH_REDIS_REST_URL", "")
-          token = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
-          print(f"URL length: {len(url)}, starts with https: {url.startswith('https://')}")
-          print(f"Token length: {len(token)}")
-          from upstash_redis import Redis
-          r = Redis(url=url, token=token)
-          r.set("debug:test", "ok", ex=60)
-          val = r.get("debug:test")
-          print(f"Redis set/get test: {val}")
-          EOF
-
       - name: Run fetch job
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
