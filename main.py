@@ -46,6 +46,7 @@ except Exception as e:
 # Redis key 定義
 USERS_KEY = "linebot:users"
 RESULT_KEY_PREFIX = "mops:result:"          # 完整訊息 (TTL 8hr)
+RAW_TEXTS_KEY_PREFIX = "mops:raw:"          # MOPS 原始文字，Groq 尚未分析 (TTL 8hr)
 
 # Fallback
 _users_fallback: set = set()
@@ -53,7 +54,8 @@ _users_lock = threading.Lock()
 
 
 # ── Redis 讀寫 ────────────────────────────────
-RESULT_TTL_SECONDS = 8 * 60 * 60       # 8 小時
+RESULT_TTL_SECONDS = 7 * 24 * 60 * 60      # 7 天
+RAW_TEXTS_TTL_SECONDS = 7 * 24 * 60 * 60  # 7 天
 
 
 def get_cached_result(date_key: str) -> Optional[str]:
@@ -81,6 +83,34 @@ def set_cached_result(date_key: str, result: str):
         print(f"[Redis SET] {date_key} (TTL {RESULT_TTL_SECONDS}s)")
     except Exception as e:
         print(f"[Redis] set_cached_result 失敗: {e}")
+
+
+def get_cached_raw_texts(date_key: str) -> Optional[dict]:
+    """回傳 {company_id: {"name":..., "text":...}} 或 None(未命中)"""
+    if redis_client is None:
+        return None
+    try:
+        key = f"{RAW_TEXTS_KEY_PREFIX}{date_key}"
+        val = redis_client.get(key)
+        if val is not None:
+            print(f"[Redis RAW HIT] {date_key}")
+            return json.loads(val)
+        print(f"[Redis RAW MISS] {date_key}")
+        return None
+    except Exception as e:
+        print(f"[Redis] get_cached_raw_texts 失敗: {e}")
+        return None
+
+
+def set_cached_raw_texts(date_key: str, raw_texts: dict):
+    if redis_client is None:
+        return
+    try:
+        key = f"{RAW_TEXTS_KEY_PREFIX}{date_key}"
+        redis_client.set(key, json.dumps(raw_texts, ensure_ascii=False), ex=RAW_TEXTS_TTL_SECONDS)
+        print(f"[Redis RAW SET] {date_key} ({len(raw_texts)} 筆)")
+    except Exception as e:
+        print(f"[Redis] set_cached_raw_texts 失敗: {e}")
 
 
 # ── 訂閱名單管理 ──────────────────────────────
@@ -327,9 +357,9 @@ def _fetch_notice_items(session, year: str, month: str, day: str) -> Optional[li
 
 
 
-def _analyze_notice_items(session, notice_items: list) -> dict[str, str]:
-    """逐一抓明細 + Groq 分析,回傳 dict: { company_id: block_text }"""
-    results = {}
+def _fetch_raw_texts(session, notice_items: list) -> dict[str, dict]:
+    """逐一抓 MOPS 明細，回傳 {company_id: {"name":..., "text":...}}，不呼叫 Groq"""
+    raw_texts = {}
     for item in notice_items:
         cid = item["company_id"]
         cname = item["company_name"]
@@ -349,14 +379,21 @@ def _analyze_notice_items(session, notice_items: list) -> dict[str, str]:
             continue
 
         for row in detail["result"]["data"]:
-            raw_text = row[9]
-            print(f"[RAW] {cid} {cname}:\n{raw_text}\n{'─'*40}")
-            block = analyze_with_groq_single(raw_text, cid, cname)
-            if block:
-                results[cid] = block
+            raw_texts[cid] = {"name": cname, "text": row[9]}
+            print(f"[RAW] {cid} {cname}: {len(row[9])} 字")
 
         time.sleep(2)
 
+    return raw_texts
+
+
+def _analyze_raw_texts(raw_texts: dict[str, dict]) -> dict[str, str]:
+    """對每筆 raw_text 呼叫 Groq 分析，回傳 {company_id: block_text}"""
+    results = {}
+    for cid, item in raw_texts.items():
+        block = analyze_with_groq_single(item["text"], cid, item["name"])
+        if block:
+            results[cid] = block
     return results
 
 
@@ -424,18 +461,30 @@ def fetch_eps(year: str, month: str, day: str) -> str:
         if cached:
             return cached
 
-        session = _create_mops_session()
-        notice_items = _fetch_notice_items(session, year, month, day)
+        # 優先讀 GitHub Actions 預先存好的 raw_texts
+        raw_texts = get_cached_raw_texts(date_key)
 
-        if notice_items is None:
-            return f"⚠️ 無法解析 {date_key} 的資料"
+        if raw_texts is None:
+            # fallback：自己抓 MOPS
+            session = _create_mops_session()
+            notice_items = _fetch_notice_items(session, year, month, day)
 
-        if not notice_items:
+            if notice_items is None:
+                return f"⚠️ 無法解析 {date_key} 的資料"
+
+            if not notice_items:
+                result = f"{date_key} 無注意清單資料"
+                set_cached_result(date_key, result)
+                return result
+
+            raw_texts = _fetch_raw_texts(session, notice_items)
+
+        if not raw_texts:
             result = f"{date_key} 無注意清單資料"
             set_cached_result(date_key, result)
             return result
 
-        blocks = _analyze_notice_items(session, notice_items)
+        blocks = _analyze_raw_texts(raw_texts)
 
         if not blocks:
             return "⚠️ 無法取得詳細 EPS 資料"
@@ -535,20 +584,17 @@ def _push_to_all_users(message: str):
 
 # ── 排程推播 ─────────────────────────────────
 def scheduled_push():
-    """每日 07:30 從 Redis 讀取結果並推播"""
+    """每日 07:30 讀取 raw_texts → Groq 分析 → 推播給所有訂閱者"""
     now_taipei = datetime.now(TZ)
+    print(f"[排程觸發] 當前台灣時間: {now_taipei}")
     target_date = get_last_trading_day(now_taipei)
     y, m, d = to_roc_ymd(target_date)
     date_key = f"{y}/{m}/{d}"
-    
-    # 只讀 cache，不爬
-    message = get_cached_result(date_key)
-    
-    if not message:
-        print(f"[排程] {date_key} Redis 無資料，跳過推播")
-        return
-    
-    if "無注意清單資料" in message:
+    print(f"[排程] 查詢前一交易日 {date_key}")
+
+    message = fetch_eps(y, m, d)
+
+    if "無注意清單資料" in message or "查無資料" in message:
         print(f"[Info] {date_key} 無注意清單，取消推播")
         return
 
@@ -674,26 +720,21 @@ def handle_message(event):
         else:
             y, m, d = text[:3], text[3:5], text[5:7]
 
-        date_key = f"{y}/{m}/{d}"
-        cached = get_cached_result(date_key)
-        if cached:
-            send_immediate_reply(event.reply_token, cached)
-        else:
-            # ── 原始做法：背景查詢 + push_message（計月配額）── 下個月初改回來
-            # send_immediate_reply(
-            #     event.reply_token,
-            #     f"🔍 正在查詢 {date_key} 資料,請稍候約 1 分鐘..."
-            # )
-            # thread = threading.Thread(
-            #     target=task_fetch_and_push,
-            #     args=(y, m, d, target_id),
-            #     daemon=True,
-            # )
-            # thread.start()
+        # ── 原始做法：背景查詢 + push_message（計月配額）── 下個月初改回來
+        # send_immediate_reply(
+        #     event.reply_token,
+        #     f"🔍 正在查詢 {y}/{m}/{d} 資料,請稍候約 1 分鐘..."
+        # )
+        # thread = threading.Thread(
+        #     target=task_fetch_and_push,
+        #     args=(y, m, d, target_id),
+        #     daemon=True,
+        # )
+        # thread.start()
 
-            # ── 替代做法：同步查詢 + reply_message（不計配額，但需等待）──
-            result = fetch_eps(y, m, d)
-            send_immediate_reply(event.reply_token, result)
+        # ── 替代做法：同步查詢 + reply_message（不計配額，但需等待）──
+        result = fetch_eps(y, m, d)
+        send_immediate_reply(event.reply_token, result)
 
 
 
