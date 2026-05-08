@@ -1,0 +1,28 @@
+name: Fetch MOPS Daily
+
+on:
+  schedule:
+    - cron: '0 23 * * 0-4'  # UTC 23:00 = 台灣 07:00，週一到週五
+  workflow_dispatch:          # 手動觸發，方便測試
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run fetch job
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_CHANNEL_SECRET: ${{ secrets.LINE_CHANNEL_SECRET }}
+        run: python fetch_job.py

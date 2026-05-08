@@ -535,21 +535,19 @@ def _push_to_all_users(message: str):
 
 # ── 排程推播 ─────────────────────────────────
 def scheduled_push():
-    """每日 07:30 從 Redis 讀取結果並推播"""
+    """每日 07:30 抓前一交易日注意清單,寫入 cache 並推播給所有訂閱者"""
     now_taipei = datetime.now(TZ)
+    print(f"[排程觸發] 當前台灣時間: {now_taipei}")
+
     target_date = get_last_trading_day(now_taipei)
     y, m, d = to_roc_ymd(target_date)
     date_key = f"{y}/{m}/{d}"
-    
-    # 只讀 cache，不爬
-    message = get_cached_result(date_key)
-    
-    if not message:
-        print(f"[排程] {date_key} Redis 無資料，跳過推播")
-        return
-    
-    if "無注意清單資料" in message:
-        print(f"[Info] {date_key} 無注意清單，取消推播")
+    print(f"[排程] 查詢前一交易日 {date_key}")
+
+    message = fetch_eps(y, m, d)
+
+    if "無注意清單資料" in message or "查無資料" in message:
+        print(f"[Info] {date_key} 無注意清單,取消推播")
         return
 
     _push_to_all_users(message)
