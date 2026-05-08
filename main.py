@@ -111,6 +111,7 @@ def set_cached_raw_texts(date_key: str, raw_texts: dict):
         print(f"[Redis RAW SET] {date_key} ({len(raw_texts)} 筆)")
     except Exception as e:
         print(f"[Redis] set_cached_raw_texts 失敗: {e}")
+        raise
 
 
 # ── 訂閱名單管理 ──────────────────────────────
