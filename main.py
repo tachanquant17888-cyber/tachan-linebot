@@ -43,10 +43,15 @@ except Exception as e:
     print(f"⚠️ Upstash Redis 連線失敗: {e}")
     redis_client = None
 
+# ── TWSE 休市日 ───────────────────────────────
+# [新增] 從 TWSE Open API 抓取當年休市日，供 get_last_trading_day 使用
+TWSE_HOLIDAY_API = "https://openapi.twse.com.tw/v1/holidaySchedule/holidaySchedule"
+_holidays: set[str] = set()  # 民國日期字串，例如 "1150619"；啟動時載入
+
 # Redis key 定義
 USERS_KEY = "linebot:users"
-RESULT_KEY_PREFIX = "mops:result:"          # 完整訊息 (TTL 8hr)
-RAW_TEXTS_KEY_PREFIX = "mops:raw:"          # MOPS 原始文字，Groq 尚未分析 (TTL 8hr)
+RESULT_KEY_PREFIX = "mops:result:"          # 完整訊息 (TTL 7天)
+RAW_TEXTS_KEY_PREFIX = "mops:raw:"          # MOPS 原始文字，Groq 尚未分析 (TTL 7天)
 
 # Fallback
 _users_fallback: set = set()
@@ -497,11 +502,42 @@ def fetch_eps(year: str, month: str, day: str) -> str:
         _release_lock(date_key)
 
 
+# ── TWSE 休市日載入 ───────────────────────────
+def fetch_twse_holidays() -> set[str]:
+    """
+    [新增] 從 TWSE Open API 抓取當年所有休市日，回傳民國日期字串 set。
+    判斷條件：Description 含「休市/放假/停止交易」，或 Name 含「市場無交易」
+    （部分休市日 description 為空，需改由 name 欄位判斷，例如春節前結算日）
+    """
+    resp = requests.get(TWSE_HOLIDAY_API, timeout=10)
+    resp.raise_for_status()
+    holidays = set()
+    for item in resp.json():
+        desc = item.get("Description", "")
+        name = item.get("Name", "")
+        if "休市" in desc or "放假" in desc or "停止交易" in desc or "市場無交易" in name:
+            holidays.add(item["Date"])
+    return holidays
+
+
 # ── 交易日工具 ────────────────────────────────
+def to_roc_date_str(d: datetime) -> str:
+    """[新增] datetime → 民國日期字串（7碼），例如 '1150619'，用於與 TWSE 休市日比對"""
+    return f"{d.year - 1911}{d.month:02d}{d.day:02d}"
+
+
 def get_last_trading_day(now: datetime) -> datetime:
+    # [修改] 原本只跳週末；現在額外比對 _holidays（TWSE 國定假日），
+    # 確保不落在例假日（如端午節週五、補假週一等）
     d = now - timedelta(days=1)
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
+    while True:
+        if d.weekday() >= 5:                  # 跳過週六(5)、週日(6)
+            d -= timedelta(days=1)
+            continue
+        if to_roc_date_str(d) in _holidays:   # 跳過國定假日
+            d -= timedelta(days=1)
+            continue
+        break
     return d
 
 
@@ -593,7 +629,13 @@ def scheduled_push():
     date_key = f"{y}/{m}/{d}"
     print(f"[排程] 查詢前一交易日 {date_key}")
 
-    message = fetch_eps(y, m, d)
+    try:
+        message = fetch_eps(y, m, d)
+    except Exception as e:
+        # fetch_eps 拋出未預期例外時，推播錯誤通知讓用戶知道，避免靜默失敗
+        print(f"[排程] fetch_eps 例外: {e}")
+        _push_to_all_users(f"⚠️ 今日推播失敗（{date_key}）\n錯誤：{type(e).__name__}")
+        return
 
     if "無注意清單資料" in message or "查無資料" in message:
         print(f"[Info] {date_key} 無注意清單，取消推播")
@@ -604,11 +646,20 @@ def scheduled_push():
 
 # ── Lifespan ──────────────────────────────────
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
+    # [新增] 啟動時從 TWSE API 載入當年休市日，存入 _holidays 供 get_last_trading_day 使用
+    global _holidays
+    try:
+        _holidays = fetch_twse_holidays()
+        print(f"✅ TWSE 休市日載入完成，共 {len(_holidays)} 筆")
+    except Exception as e:
+        # 載入失敗時 _holidays 維持空 set，退化成只跳週末（不中斷服務）
+        print(f"⚠️ 無法載入 TWSE 休市日（將只跳過週末）: {e}")
+
     scheduler = BackgroundScheduler(timezone="Asia/Taipei")
     scheduler.add_job(
         scheduled_push, 'cron',
-        day_of_week='tue-sat', hour=7, minute=30,
+        day_of_week='mon-fri', hour=7, minute=30,
         id='push_morning'
     )
     scheduler.start()
