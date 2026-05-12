@@ -2,7 +2,7 @@ name: Fetch MOPS Daily
 
 on:
   schedule:
-    - cron: '0 23 * * 0-4'  # UTC 23:00 = 台灣 07:00，週一到週五
+    - cron: '30 21 * * 0-4'  # UTC 21:30 = 台灣 05:30，週一到週五（預留 2hr 緩衝給 Actions 延遲）
   workflow_dispatch:          # 手動觸發，方便測試
 
 jobs:
