@@ -308,6 +308,8 @@ def _create_mops_session():
 
 
 NOTICE_KEYWORDS = ("注意", "證券近期")
+# 可轉債/公司債公告的類別關鍵字 — 符合此條件的公告直接排除，不抓明細
+BOND_CATEGORY_KEYWORDS = ("可轉換公司債", "轉換公司債", "普通公司債", "海外可轉換公司債")
 
 def _fetch_notice_items(session, year: str, month: str, day: str) -> Optional[list]:
     """
@@ -345,12 +347,17 @@ def _fetch_notice_items(session, year: str, month: str, day: str) -> Optional[li
 
     notice_items = []
     for row in rows:
-        if any(kw in row[4] for kw in NOTICE_KEYWORDS):
+        category = row[4]
+        # 符合注意關鍵字，且公告類別本身不是可轉債/公司債
+        if any(kw in category for kw in NOTICE_KEYWORDS) and \
+           not any(bk in category for bk in BOND_CATEGORY_KEYWORDS):
             notice_items.append({
                 "company_id": row[2],
                 "company_name": row[3],
                 "params": row[5]["parameters"],
             })
+        elif any(kw in category for kw in NOTICE_KEYWORDS):
+            print(f"[MOPS] 跳過可轉債公告: {row[2]} {row[3]} → {category[:40]}")
 
     if notice_items:
         filtered_summary = ", ".join(f"{it['company_id']} {it['company_name']}" for it in notice_items)
@@ -385,8 +392,14 @@ def _fetch_raw_texts(session, notice_items: list) -> dict[str, dict]:
             continue
 
         for row in detail["result"]["data"]:
-            raw_texts[cid] = {"name": cname, "text": row[9]}
-            print(f"[RAW] {cid} {cname}: {len(row[9])} 字")
+            new_text = row[9]
+            if cid in raw_texts:
+                # 同公司有多筆公告（例如同時有股票注意 + 另一筆）→ 拼接，Groq 一次分析全部
+                raw_texts[cid]["text"] += "\n\n" + new_text
+                print(f"[RAW] {cid} {cname}: 拼接第二筆（共 {len(raw_texts[cid]['text'])} 字）")
+            else:
+                raw_texts[cid] = {"name": cname, "text": new_text}
+                print(f"[RAW] {cid} {cname}: {len(new_text)} 字")
 
         time.sleep(2)
 
