@@ -752,7 +752,7 @@ def handle_message(event):
 
     text = event.message.text.strip()
 
-    is_keyword = text in ["訂閱", "取消訂閱", "今日", "today", "指令"]
+    is_keyword = text in ["訂閱", "取消訂閱", "今日", "today", "指令", "前一交易日警示"]
     is_date_query = bool(re.match(r"^\d{7}$", text))
     if not (is_keyword or is_date_query):
         return
@@ -773,15 +773,19 @@ def handle_message(event):
         send_immediate_reply(event.reply_token, (
             "📋 指令說明:\n"
             "  今日 → 查今天 EPS 注意清單\n"
+            "  前一交易日警示 → 查前一個交易日注意清單\n"
             "  1150327 → 查指定日期\n"
             "  訂閱 → 每天 7:30 自動推播\n"
             "  取消訂閱 → 停止推播"
         ))
 
-    elif text in ["今日", "today"] or re.match(r"^\d{7}$", text):
+    elif text in ["今日", "today"] or text == "前一交易日警示" or re.match(r"^\d{7}$", text):
         if text in ["今日", "today"]:
             now = datetime.now(TZ)
             y, m, d = to_roc_ymd(now)
+        elif text == "前一交易日警示":
+            now = datetime.now(TZ)
+            y, m, d = to_roc_ymd(get_last_trading_day(now))
         else:
             y, m, d = text[:3], text[3:5], text[5:7]
 
