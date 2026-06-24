@@ -307,7 +307,7 @@ def _create_mops_session():
 
 
 
-NOTICE_KEYWORDS = ("注意", "證券近期")
+NOTICE_KEYWORDS = ("注意", "證券近期","股(債)價量異常")
 # 可轉債/公司債公告的類別關鍵字 — 符合此條件的公告直接排除，不抓明細
 BOND_CATEGORY_KEYWORDS = ("可轉換公司債", "轉換公司債", "普通公司債", "海外可轉換公司債")
 
