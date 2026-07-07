@@ -246,7 +246,7 @@ def analyze_with_groq_single(raw_text: str, company_id: str, company_name: str) 
   → 兩種格式都適用,取第一個數字欄(最新期),跳過與去年比較欄
 - 「單月」區段的數字 → latest_month_*;「單季」區段的數字 → latest_quarter_*
 - 「每股盈餘」或「EPS」或「稅後盈餘」或「每股淨利」或「稅前盈餘」或「稅前EPS」那列 → 取出 latest_month_eps 和 latest_quarter_eps
-- 「營業收入」那列 → 取出 latest_month_revenue 和 latest_quarter_revenue(單位:百萬)
+- 「營業收入」那列 → 取出 latest_month_revenue 和 latest_quarter_revenue(單位:百萬),注意取得數值不要把","認作小數點"."
 - is_bond: 文本【主體】是可轉債/公司債資訊(無股票財務表格)才填 true;若主體是股票財務表格、只是附帶提及可轉債代號則填 false
 - EPS跟每股盈餘如果是虧損請填負數,如 (0.19) → -0.19
 - 括號數字 = 負數,例如 (0.06) → -0.06、(19.32) → -19.32
