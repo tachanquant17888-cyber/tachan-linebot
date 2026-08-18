@@ -32,6 +32,10 @@ load_dotenv()
 configuration = Configuration(access_token=os.environ['LINE_CHANNEL_ACCESS_TOKEN'])
 handler = WebhookHandler(os.environ['LINE_CHANNEL_SECRET'])
 groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
+# Groq 會不定期下架舊模型(llama-3.3-70b-versatile 已於 2025 下架)，
+# 改用環境變數控制，換模型不必改程式
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_MAX_RETRY = 3
 
 TZ = ZoneInfo("Asia/Taipei")
 
@@ -218,6 +222,61 @@ def calc_eps_growth(data: dict) -> str:
     )
 
 
+# ── Groq 回應解析工具 ─────────────────────────
+_NUMBER_RE = re.compile(r"-?\d[\d,]*\.?\d*")
+_NUMERIC_FIELDS = (
+    "latest_month_eps", "latest_quarter_eps",
+    "latest_month_revenue", "latest_quarter_revenue",
+)
+
+
+def _to_number(value) -> Optional[float]:
+    """Groq 回傳值轉 float:'1,118'、'(0.37)'、'101 百萬' 都能吃,失敗回 None"""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    negative = s.startswith("(") and s.endswith(")")
+    m = _NUMBER_RE.search(s)
+    if not m:
+        return None
+    try:
+        n = float(m.group().replace(",", ""))
+    except ValueError:
+        return None
+    return -n if negative else n
+
+
+def _normalize_financials(data: dict) -> dict:
+    """數字欄位一律轉 float,避免字串跑進後面的格式化計算造成例外"""
+    normalized = dict(data)
+    for key in _NUMERIC_FIELDS:
+        normalized[key] = _to_number(data.get(key))
+    return normalized
+
+
+def _parse_groq_json(text: Optional[str]) -> dict:
+    """容錯解析:去 markdown 圍欄 → 去千分位逗號 → 只取第一個 JSON 物件"""
+    if not text or not text.strip():
+        raise ValueError("Groq 回應為空")
+    cleaned = text.replace("```json", "").replace("```", "").strip()
+    candidates = [
+        cleaned,
+        re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", cleaned),  # 1,118 → 1118
+    ]
+    match = re.search(r"\{.*\}", cleaned, re.S)
+    if match:
+        candidates.append(match.group())
+    last_err: Exception = ValueError("無法解析 Groq JSON")
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as e:
+            last_err = e
+    raise last_err
+
+
 # ── Groq 分析 ────────────────────────────────
 def analyze_with_groq_single(raw_text: str, company_id: str, company_name: str) -> str:
     """單次 Groq 呼叫:同時取得 EPS 描述 + 財務數字"""
@@ -257,35 +316,52 @@ def analyze_with_groq_single(raw_text: str, company_id: str, company_name: str) 
 - 月份/季別必須從文本擷取,不可推算
 - 找不到填 null"""
 
-    try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            max_tokens=250,
-            temperature=0,
-        )
-        text = response.choices[0].message.content.strip()
-        text = text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(text)
+    # 推理型模型(gpt-oss / qwen)才吃 reasoning_effort,其他模型傳了會 400
+    extra_kwargs = (
+        {"reasoning_effort": "low"}
+        if GROQ_MODEL.startswith(("openai/gpt-oss", "qwen/"))
+        else {}
+    )
 
-        if data.get("is_bond"):
-            return ""
+    last_err: Optional[Exception] = None
+    for attempt in range(1, GROQ_MAX_RETRY + 1):
+        try:
+            response = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                # 推理模型的思考 token 也算在 max_tokens 內,250 會被截斷
+                max_tokens=1024,
+                temperature=0,
+                response_format={"type": "json_object"},
+                **extra_kwargs,
+            )
+            data = _parse_groq_json(response.choices[0].message.content)
 
-        revenue_text = calc_revenue_growth(data)
-        eps_growth_text = calc_eps_growth(data)
+            if data.get("is_bond"):
+                return ""
 
-        return (
-            f"【{company_id} {company_name}】\n"
-            f"{eps_growth_text}\n\n"
-            f"{revenue_text}"
-        )
+            data = _normalize_financials(data)
+            revenue_text = calc_revenue_growth(data)
+            eps_growth_text = calc_eps_growth(data)
 
-    except Exception as e:
-        print(f"Groq 分析失敗 ({company_id}): {e}")
-        return f"【{company_id} {company_name}】\n⚠️ 無法取得分析"
+            return (
+                f"【{company_id} {company_name}】\n"
+                f"{eps_growth_text}\n\n"
+                f"{revenue_text}"
+            )
+
+        except Exception as e:
+            last_err = e
+            print(f"Groq 分析失敗 ({company_id}) 第 {attempt}/{GROQ_MAX_RETRY} 次 "
+                  f"[{GROQ_MODEL}] {type(e).__name__}: {e}")
+            if attempt < GROQ_MAX_RETRY:
+                time.sleep(2 * attempt)
+
+    print(f"Groq 分析放棄 ({company_id}): {type(last_err).__name__}: {last_err}")
+    return f"【{company_id} {company_name}】\n⚠️ 無法取得分析"
 
 
 # ── MOPS 爬蟲 ────────────────────────────────

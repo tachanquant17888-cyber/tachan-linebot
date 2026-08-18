@@ -20,6 +20,7 @@ load_dotenv()
 
 TZ = ZoneInfo("Asia/Taipei")
 groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 SEP = "=" * 60
 SEP2 = "-" * 40
@@ -279,17 +280,20 @@ def analyze_with_groq(raw_text: str, cid: str, cname: str) -> str:
 - 月份/季別必須從文本擷取,不可推算
 - 找不到填 null"""
 
-    print(f"\n  [Groq] 送出請求 → llama-3.3-70b-versatile …")
+    print(f"\n  [Groq] 送出請求 → {GROQ_MODEL} …")
 
     try:
         response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=GROQ_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": user_prompt},
             ],
-            max_tokens=250,
+            max_tokens=1024,
             temperature=0,
+            response_format={"type": "json_object"},
+            **({"reasoning_effort": "low"}
+               if GROQ_MODEL.startswith(("openai/gpt-oss", "qwen/")) else {}),
         )
         raw_groq = response.choices[0].message.content.strip()
 
