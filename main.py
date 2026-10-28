@@ -771,7 +771,7 @@ def discord_push(content: str):
 
 
 def scheduled_discord_push():
-    """每日 15:30 推播前一交易日注意清單到 Discord（內容與 LINE 推播相同）"""
+    """每日 07:30 推播前一交易日注意清單到 Discord（內容與 LINE 推播相同）"""
     message = build_morning_message()
     if message:
         discord_push(message)
@@ -803,10 +803,10 @@ async def lifespan(_app: FastAPI):
     # Discord 推播不受 ENABLE_MORNING_PUSH 影響
     scheduler.add_job(
         scheduled_discord_push, 'cron',
-        day_of_week='mon-fri', hour=15, minute=30,
+        day_of_week='mon-fri', hour=7, minute=30,
         id='discord_morning'
     )
-    print("✅ 已排程每日 15:30 推播前一交易日注意清單到 Discord")
+    print("✅ 已排程每日 07:30 推播前一交易日注意清單到 Discord")
     scheduler.start()
     print("✅ Scheduler 已啟動")
     yield
