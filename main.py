@@ -746,13 +746,18 @@ async def lifespan(_app: FastAPI):
         print(f"⚠️ 無法載入 TWSE 休市日（將只跳過週末）: {e}")
 
     scheduler = BackgroundScheduler(timezone="Asia/Taipei")
-    scheduler.add_job(
-        scheduled_push, 'cron',
-        day_of_week='mon-fri', hour=7, minute=30,
-        id='push_morning'
-    )
+    # 環境變數 ENABLE_MORNING_PUSH=false 可關閉 07:30 推播（預設開啟）
+    if os.getenv("ENABLE_MORNING_PUSH", "true").strip().lower() == "true":
+        scheduler.add_job(
+            scheduled_push, 'cron',
+            day_of_week='mon-fri', hour=7, minute=30,
+            id='push_morning'
+        )
+        print("✅ 已排程每日 07:30 推播前一交易日注意清單")
+    else:
+        print("⏸️ ENABLE_MORNING_PUSH=false，07:30 推播已關閉")
     scheduler.start()
-    print("✅ Scheduler 已啟動 (每日 07:30 推播前一交易日注意清單)")
+    print("✅ Scheduler 已啟動")
     yield
     scheduler.shutdown()
     print("🛑 Scheduler 已關閉")
