@@ -709,8 +709,8 @@ def _push_to_all_users(message: str):
 
 
 # ── 排程推播 ─────────────────────────────────
-def scheduled_push():
-    """每日 07:30 讀取 raw_texts → Groq 分析 → 推播給所有訂閱者"""
+def build_morning_message():
+    """讀取前一交易日 raw_texts → Groq 分析，回傳推播訊息；無注意清單時回傳 None"""
     now_taipei = datetime.now(TZ)
     print(f"[排程觸發] 當前台灣時間: {now_taipei}")
     target_date = get_last_trading_day(now_taipei)
@@ -723,14 +723,20 @@ def scheduled_push():
     except Exception as e:
         # fetch_eps 拋出未預期例外時，推播錯誤通知讓用戶知道，避免靜默失敗
         print(f"[排程] fetch_eps 例外: {e}")
-        _push_to_all_users(f"⚠️ 今日推播失敗（{date_key}）\n錯誤：{type(e).__name__}")
-        return
+        return f"⚠️ 今日推播失敗（{date_key}）\n錯誤：{type(e).__name__}"
 
     if "無注意清單資料" in message or "查無資料" in message:
         print(f"[Info] {date_key} 無注意清單，取消推播")
-        return
+        return None
 
-    _push_to_all_users(message)
+    return message
+
+
+def scheduled_push():
+    """每日 07:30 推播前一交易日注意清單給所有 LINE 訂閱者"""
+    message = build_morning_message()
+    if message:
+        _push_to_all_users(message)
 
 
 # ── Discord 推播 ─────────────────────────────
@@ -740,17 +746,35 @@ def discord_push(content: str):
     if not url:
         print("⚠️ 未設定 DISCORD_WEBHOOK_URL，略過 Discord 推播")
         return
+    # Discord 單則訊息上限 2000 字，超過時依換行切段分批送出
+    chunks, buf = [], ""
+    for line in content.splitlines(keepends=True):
+        while len(line) > 2000:
+            if buf:
+                chunks.append(buf)
+                buf = ""
+            chunks.append(line[:2000])
+            line = line[2000:]
+        if len(buf) + len(line) > 2000:
+            chunks.append(buf)
+            buf = ""
+        buf += line
+    if buf:
+        chunks.append(buf)
     try:
-        r = requests.post(url, json={"content": content}, timeout=10)
-        r.raise_for_status()
-        print(f"[Discord] 推播成功: {content[:30]}")
+        for chunk in chunks:
+            r = requests.post(url, json={"content": chunk}, timeout=10)
+            r.raise_for_status()
+        print(f"[Discord] 推播成功（{len(chunks)} 則）: {content[:30]}")
     except Exception as e:
         print(f"[Discord] 推播失敗: {e}")
 
 
-def scheduled_discord_hello():
-    """測試用：每日 15:00 推播 hello 到 Discord"""
-    discord_push("hello")
+def scheduled_discord_push():
+    """每日 15:30 推播前一交易日注意清單到 Discord（內容與 LINE 推播相同）"""
+    message = build_morning_message()
+    if message:
+        discord_push(message)
 
 
 # ── Lifespan ──────────────────────────────────
@@ -776,13 +800,13 @@ async def lifespan(_app: FastAPI):
         print("✅ 已排程每日 07:30 推播前一交易日注意清單")
     else:
         print("⏸️ ENABLE_MORNING_PUSH=false，07:30 推播已關閉")
-    # 測試用：每日 15:00 推播 hello 到 Discord
+    # Discord 推播不受 ENABLE_MORNING_PUSH 影響
     scheduler.add_job(
-        scheduled_discord_hello, 'cron',
-        hour=15, minute=0,
-        id='discord_hello'
+        scheduled_discord_push, 'cron',
+        day_of_week='mon-fri', hour=15, minute=30,
+        id='discord_morning'
     )
-    print("✅ 已排程每日 15:00 推播 Discord hello")
+    print("✅ 已排程每日 15:30 推播前一交易日注意清單到 Discord")
     scheduler.start()
     print("✅ Scheduler 已啟動")
     yield
