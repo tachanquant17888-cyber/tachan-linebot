@@ -733,6 +733,26 @@ def scheduled_push():
     _push_to_all_users(message)
 
 
+# ── Discord 推播 ─────────────────────────────
+def discord_push(content: str):
+    """透過 Discord 頻道 webhook 推播文字訊息（webhook 由 DISCORD_WEBHOOK_URL 設定）"""
+    url = os.getenv("DISCORD_WEBHOOK_URL")
+    if not url:
+        print("⚠️ 未設定 DISCORD_WEBHOOK_URL，略過 Discord 推播")
+        return
+    try:
+        r = requests.post(url, json={"content": content}, timeout=10)
+        r.raise_for_status()
+        print(f"[Discord] 推播成功: {content[:30]}")
+    except Exception as e:
+        print(f"[Discord] 推播失敗: {e}")
+
+
+def scheduled_discord_hello():
+    """測試用：每日 15:00 推播 hello 到 Discord"""
+    discord_push("hello")
+
+
 # ── Lifespan ──────────────────────────────────
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -756,6 +776,13 @@ async def lifespan(_app: FastAPI):
         print("✅ 已排程每日 07:30 推播前一交易日注意清單")
     else:
         print("⏸️ ENABLE_MORNING_PUSH=false，07:30 推播已關閉")
+    # 測試用：每日 15:00 推播 hello 到 Discord
+    scheduler.add_job(
+        scheduled_discord_hello, 'cron',
+        hour=15, minute=0,
+        id='discord_hello'
+    )
+    print("✅ 已排程每日 15:00 推播 Discord hello")
     scheduler.start()
     print("✅ Scheduler 已啟動")
     yield
