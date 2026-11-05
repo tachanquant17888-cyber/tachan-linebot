@@ -771,10 +771,9 @@ def discord_push(content: str):
 
 
 def scheduled_discord_push():
-    """每日 07:30 推播前一交易日注意清單到 Discord（內容與 LINE 推播相同）"""
+    """每日 07:30 推播前一交易日注意清單到 Discord（內容與 LINE 推播相同；無注意清單時推播「今日無警示股」）"""
     message = build_morning_message()
-    if message:
-        discord_push(message)
+    discord_push(message if message else "今日無警示股")
 
 
 # ── Lifespan ──────────────────────────────────
