@@ -781,7 +781,7 @@ Q3_RANK_END_DATE = "2026-11-16 23:59:59"   # Q3 財報季到 11/15，11/16 推�
 
 
 def scheduled_discord_q3_rank():
-    """每日 16:50 推播 Q3 財報 EPS+營收 QoQ 雙成長排行到 Discord（只用 regex，不呼叫 Groq）
+    """每日 08:00 推播 Q3 財報 EPS+營收 QoQ 雙成長排行到 Discord（只用 regex，不呼叫 Groq）
     範圍：前一交易日 ~ 昨天（週一會含週六、週日，截止日前公司週末也會公告）"""
     now = datetime.now(TZ)
     d, yesterday = get_last_trading_day(now).date(), (now - timedelta(days=1)).date()
@@ -829,11 +829,11 @@ async def lifespan(_app: FastAPI):
     print("✅ 已排程每日 07:30 推播前一交易日注意清單到 Discord")
     scheduler.add_job(
         scheduled_discord_q3_rank, 'cron',
-        day_of_week='mon-fri', hour=16, minute=50,
+        day_of_week='mon-fri', hour=8, minute=0,
         end_date=Q3_RANK_END_DATE,
         id='discord_q3_rank'
     )
-    print(f"✅ 已排程每日 16:50 推播 Q3 財報雙成長排行到 Discord（至 {Q3_RANK_END_DATE[:10]}）")
+    print(f"✅ 已排程每日 08:00 推播 Q3 財報雙成長排行到 Discord（至 {Q3_RANK_END_DATE[:10]}）")
     scheduler.start()
     print("✅ Scheduler 已啟動")
     yield
