@@ -22,6 +22,7 @@ import json
 import os
 import threading
 from upstash_redis import Redis
+from q3_rank import build_q3_rank_text
 
 
 
@@ -740,11 +741,11 @@ def scheduled_push():
 
 
 # ── Discord 推播 ─────────────────────────────
-def discord_push(content: str):
-    """透過 Discord 頻道 webhook 推播文字訊息（webhook 由 DISCORD_WEBHOOK_URL 設定）"""
-    url = os.getenv("DISCORD_WEBHOOK_URL")
+def discord_push(content: str, env_key: str = "DISCORD_WEBHOOK_URL"):
+    """透過 Discord 頻道 webhook 推播文字訊息（webhook 網址由環境變數 env_key 設定）"""
+    url = os.getenv(env_key)
     if not url:
-        print("⚠️ 未設定 DISCORD_WEBHOOK_URL，略過 Discord 推播")
+        print(f"⚠️ 未設定 {env_key}，略過 Discord 推播")
         return
     # Discord 單則訊息上限 2000 字，超過時依換行切段分批送出
     chunks, buf = [], ""
@@ -774,6 +775,26 @@ def scheduled_discord_push():
     """每日 07:30 推播前一交易日注意清單到 Discord（內容與 LINE 推播相同；無注意清單時推播「今日無警示股」）"""
     message = build_morning_message()
     discord_push(message if message else "今日無警示股")
+
+
+Q3_RANK_END_DATE = "2026-11-16 23:59:59"   # Q3 財報季到 11/15，11/16 推最後一次（含 11/13~11/15）
+
+
+def scheduled_discord_q3_rank():
+    """每日 16:50 推播 Q3 財報 EPS+營收 QoQ 雙成長排行到 Discord（只用 regex，不呼叫 Groq）
+    範圍：前一交易日 ~ 昨天（週一會含週六、週日，截止日前公司週末也會公告）"""
+    now = datetime.now(TZ)
+    d, yesterday = get_last_trading_day(now).date(), (now - timedelta(days=1)).date()
+    dates = []
+    while d <= yesterday:
+        dates.append(to_roc_ymd(d))
+        d += timedelta(days=1)
+    try:
+        message = build_q3_rank_text(_create_mops_session(), dates)
+    except Exception as e:
+        print(f"[Q3排行] 失敗: {e}")
+        message = f"⚠️ Q3財報排行推播失敗（{'/'.join(dates[-1])}）\n錯誤：{type(e).__name__}"
+    discord_push(message, env_key="DISCORD_WEBHOOK_URL_Q3")
 
 
 # ── Lifespan ──────────────────────────────────
@@ -806,6 +827,13 @@ async def lifespan(_app: FastAPI):
         id='discord_morning'
     )
     print("✅ 已排程每日 07:30 推播前一交易日注意清單到 Discord")
+    scheduler.add_job(
+        scheduled_discord_q3_rank, 'cron',
+        day_of_week='mon-fri', hour=16, minute=50,
+        end_date=Q3_RANK_END_DATE,
+        id='discord_q3_rank'
+    )
+    print(f"✅ 已排程每日 16:50 推播 Q3 財報雙成長排行到 Discord（至 {Q3_RANK_END_DATE[:10]}）")
     scheduler.start()
     print("✅ Scheduler 已啟動")
     yield
