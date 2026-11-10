@@ -9,4 +9,3 @@ apscheduler
 groq
 upstash-redis
 finlab
-discord.py

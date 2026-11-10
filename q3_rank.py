@@ -144,6 +144,7 @@ def build_rank(df: pd.DataFrame, western_year: int) -> pd.DataFrame:
     df["營收成長%"] = ((df["Q3營收"] - df["Q2營收"]) / df["Q2營收"] * 100).round(2)
     df = df[df["營收成長%"] > 0].copy()
     df["成長差%"] = (df["EPS成長%"] - df["營收成長%"]).round(2)
+    df = df[(df["成長差%"] >= 0) & (df["eps"] >= 0)]   # 只留成長差 >= 0% 且 Q3 單季 EPS >= 0
     return df.sort_values("成長差%", ascending=False).reset_index(drop=True)
 
 
