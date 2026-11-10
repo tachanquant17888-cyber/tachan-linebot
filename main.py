@@ -21,6 +21,8 @@ import time
 import json
 import os
 import threading
+import asyncio
+import discord
 from upstash_redis import Redis
 from q3_rank import build_q3_rank_text
 
@@ -747,7 +749,18 @@ def discord_push(content: str, env_key: str = "DISCORD_WEBHOOK_URL"):
     if not url:
         print(f"⚠️ 未設定 {env_key}，略過 Discord 推播")
         return
-    # Discord 單則訊息上限 2000 字，超過時依換行切段分批送出
+    chunks = _split_discord_chunks(content)
+    try:
+        for chunk in chunks:
+            r = requests.post(url, json={"content": chunk}, timeout=10)
+            r.raise_for_status()
+        print(f"[Discord] 推播成功（{len(chunks)} 則）: {content[:30]}")
+    except Exception as e:
+        print(f"[Discord] 推播失敗: {e}")
+
+
+def _split_discord_chunks(content: str) -> list:
+    """Discord 單則訊息上限 2000 字，超過時依換行切段"""
     chunks, buf = [], ""
     for line in content.splitlines(keepends=True):
         while len(line) > 2000:
@@ -762,13 +775,7 @@ def discord_push(content: str, env_key: str = "DISCORD_WEBHOOK_URL"):
         buf += line
     if buf:
         chunks.append(buf)
-    try:
-        for chunk in chunks:
-            r = requests.post(url, json={"content": chunk}, timeout=10)
-            r.raise_for_status()
-        print(f"[Discord] 推播成功（{len(chunks)} 則）: {content[:30]}")
-    except Exception as e:
-        print(f"[Discord] 推播失敗: {e}")
+    return chunks
 
 
 def scheduled_discord_push():
@@ -780,8 +787,8 @@ def scheduled_discord_push():
 Q3_RANK_END_DATE = "2026-11-16 23:59:59"   # Q3 財報季到 11/15，11/16 推最後一次（含 11/13~11/15）
 
 
-def scheduled_discord_q3_rank():
-    """每日 08:00 推播 Q3 財報 EPS+營收 QoQ 雙成長排行到 Discord（只用 regex，不呼叫 Groq）
+def build_q3_rank_message() -> str:
+    """Q3 財報 EPS+營收 QoQ 雙成長排行（只用 regex，不呼叫 Groq）
     範圍：前一交易日 ~ 昨天（週一會含週六、週日，截止日前公司週末也會公告）"""
     now = datetime.now(TZ)
     d, yesterday = get_last_trading_day(now).date(), (now - timedelta(days=1)).date()
@@ -794,7 +801,46 @@ def scheduled_discord_q3_rank():
     except Exception as e:
         print(f"[Q3排行] 失敗: {e}")
         message = f"⚠️ Q3財報排行推播失敗（{'/'.join(dates[-1])}）\n錯誤：{type(e).__name__}"
-    discord_push(message, env_key="DISCORD_WEBHOOK_URL_Q3")
+    return message
+
+
+def scheduled_discord_q3_rank():
+    """每日 08:00 推播 Q3 財報排行到 Discord"""
+    discord_push(build_q3_rank_message(), env_key="DISCORD_WEBHOOK_URL_Q3")
+
+
+# ── Discord Bot（手動查詢指令）──────────────────
+# 在 bot 看得到的頻道輸入「季報查詢」→ 回覆前一交易日~昨天的 Q3 財報排行
+# 需環境變數 DISCORD_BOT_TOKEN，且 Developer Portal 要開啟 Message Content Intent
+Q3_QUERY_COMMAND = "季報查詢"
+_q3_query_lock = asyncio.Lock()
+
+
+def _create_discord_bot() -> discord.Client:
+    intents = discord.Intents.default()
+    intents.message_content = True
+    bot = discord.Client(intents=intents)
+
+    @bot.event
+    async def on_ready():
+        print(f"✅ Discord Bot 已登入: {bot.user}")
+
+    @bot.event
+    async def on_message(message: discord.Message):
+        if message.author.bot or message.content.strip() != Q3_QUERY_COMMAND:
+            return
+        if _q3_query_lock.locked():
+            await message.channel.send("⏳ 季報查詢進行中，請稍候")
+            return
+        async with _q3_query_lock:
+            print(f"[Discord Bot] {message.author} 觸發季報查詢")
+            await message.channel.send("🔍 季報查詢中，約需 1~3 分鐘…")
+            # MOPS + finlab 是同步阻塞呼叫，丟到 thread 執行避免卡住 event loop
+            text = await asyncio.to_thread(build_q3_rank_message)
+            for chunk in _split_discord_chunks(text):
+                await message.channel.send(chunk)
+
+    return bot
 
 
 # ── Lifespan ──────────────────────────────────
@@ -836,7 +882,17 @@ async def lifespan(_app: FastAPI):
     print(f"✅ 已排程每日 08:00 推播 Q3 財報雙成長排行到 Discord（至 {Q3_RANK_END_DATE[:10]}）")
     scheduler.start()
     print("✅ Scheduler 已啟動")
+
+    discord_bot = None
+    bot_token = os.getenv("DISCORD_BOT_TOKEN")
+    if bot_token:
+        discord_bot = _create_discord_bot()
+        asyncio.create_task(discord_bot.start(bot_token))
+    else:
+        print("⏸️ 未設定 DISCORD_BOT_TOKEN，Discord「季報查詢」指令未啟用")
     yield
+    if discord_bot:
+        await discord_bot.close()
     scheduler.shutdown()
     print("🛑 Scheduler 已關閉")
 
