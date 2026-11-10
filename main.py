@@ -22,9 +22,8 @@ import json
 import os
 import threading
 import asyncio
-import discord
 from upstash_redis import Redis
-from q3_rank import build_q3_rank_text
+# discord / q3_rank(pandas) 改在用到時才 import，縮短啟動時間（Render Free 啟動太慢會部署逾時）
 
 
 
@@ -797,6 +796,7 @@ def build_q3_rank_message() -> str:
         dates.append(to_roc_ymd(d))
         d += timedelta(days=1)
     try:
+        from q3_rank import build_q3_rank_text
         message = build_q3_rank_text(_create_mops_session(), dates)
     except Exception as e:
         print(f"[Q3排行] 失敗: {e}")
@@ -816,7 +816,8 @@ Q3_QUERY_COMMAND = "季報查詢"
 _q3_query_lock = asyncio.Lock()
 
 
-def _create_discord_bot() -> discord.Client:
+def _create_discord_bot():
+    import discord
     intents = discord.Intents.default()
     intents.message_content = True
     bot = discord.Client(intents=intents)
@@ -900,7 +901,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])   # HEAD 給 Render 健康檢查 / cron-job 用
 def health_check():
     return {"status": "ok"}
 
