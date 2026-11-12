@@ -3,6 +3,7 @@
 ## 一、系統角色
 
 LINE Bot，每日早上自動推播 MOPS（公開資訊觀測站）的「注意清單」EPS 分析，並支援使用者手動查詢當日 / 指定日期。
+另有 Discord 推播：注意清單（07:30）與 Q3 財報 EPS+營收 QoQ 雙成長排行（08:30 / 16:30，財報季限定，見第八節）。
 
 ### 外部依賴
 
@@ -13,8 +14,10 @@ LINE Bot，每日早上自動推播 MOPS（公開資訊觀測站）的「注意�
 | Groq (`llama-3.3-70b-versatile`) | 從 MOPS 明細抽出 EPS / 營收 JSON |
 | MOPS `t05st02` API | 注意清單列表 + 明細 |
 | TWSE Open API (`holidaySchedule`) | 當年休市日清單，供 `get_last_trading_day` 跳過國定假日 |
-| APScheduler | 排程 (Mon–Fri 07:30，在 Render 上執行) |
-| GitHub Actions | 排程 (Mon–Fri 07:00 UTC+8)，負責 MOPS 爬蟲預熱 |
+| APScheduler | 排程 (Mon–Fri 07:30 注意清單、08:30 / 16:30 Q3 排行，在 Render 上執行) |
+| GitHub Actions | 排程 (Mon–Fri 05:30 注意清單、07:00 Q3 財報，UTC+8)，負責 MOPS 爬蟲預熱 |
+| finlab | Q3 排行用的 Q1/Q2 單季 EPS、月營收（需 `FINLAB_API_TOKEN`） |
+| Discord Webhook | `DISCORD_WEBHOOK_URL`（注意清單）、`DISCORD_WEBHOOK_URL_Q3`（Q3 排行） |
 | FastAPI + uvicorn | Webhook server（Render 上常駐） |
 
 ---
@@ -27,6 +30,8 @@ LINE Bot，每日早上自動推播 MOPS（公開資訊觀測站）的「注意�
 | `mops:raw:{date_key}` | STRING (JSON) | 7 天 | GitHub Actions 預抓的 MOPS 原始文字，尚未 Groq 分析 |
 | `mops:result:{date_key}` | STRING | 7 天 | Groq 分析完成後的完整推播訊息 |
 | `mops:lock:{date_key}` | STRING | 5 min | 分散式 Lock，防止同一 date_key 並發打 MOPS |
+| `q3:eps:{yyymmdd}` | HASH | 14 天 | Q3 財報公告累計 EPS 快取，field=股號、value=累計EPS(JSON，抓不到為 null) |
+| `q3:pushed:{morning\|today}:{YYYYMMDD}` | STRING | 2 天 | Q3 排行當日已推播旗標，防重複推播、供重啟補跑判斷 |
 
 `date_key` 格式：民國年/月/日，例如 `115/04/23`。
 
@@ -35,7 +40,7 @@ LINE Bot，每日早上自動推播 MOPS（公開資訊觀測站）的「注意�
 ## 三、雙執行環境架構
 
 ```
-GitHub Actions (Mon–Fri 07:00)          Render (常駐)
+GitHub Actions (Mon–Fri 05:30)          Render (常駐)
   fetch_job.py                            main.py (APScheduler Mon–Fri 07:30)
        │                                         │
        │  0. fetch_twse_holidays()               │  0. fetch_twse_holidays()  ← lifespan 啟動時
@@ -113,7 +118,7 @@ GitHub Actions (Mon–Fri 07:00)          Render (常駐)
 
 `scheduled_push()`：
 - 每日（Mon–Fri）07:30 呼叫 `get_last_trading_day` 取得前一交易日，再呼叫 `fetch_eps()` 取得分析結果
-- GitHub Actions 在 07:00 已存好 `mops:raw:`，07:30 只需做 Groq 分析
+- GitHub Actions 在 05:30 已存好 `mops:raw:`，07:30 只需做 Groq 分析
 - 若該日無注意清單則不推播
 
 ---
@@ -123,7 +128,7 @@ GitHub Actions (Mon–Fri 07:00)          Render (常駐)
 ### 5.1 每日推播（正常路徑）
 
 ```
-GitHub Actions 07:00 (Mon–Fri)
+GitHub Actions 05:30 (Mon–Fri，`.github/workflows/fetch_mops.yml`)
   → fetch_job.py
     → fetch_twse_holidays()          ← 載入當年休市日到 _holidays
     → get_last_trading_day(now)      ← 跳過週末 + 國定假日
@@ -200,7 +205,7 @@ Lock 確保同一 date_key 只有一個請求執行完整流程，其他請求�
 
 ### 6.3 為什麼 cache TTL 是 7 天？
 
-- GitHub Actions 07:00 存 raw_texts → Render 07:30 消費，間隔 30 分鐘
+- GitHub Actions 05:30 存 raw_texts → Render 07:30 消費，間隔 2 小時（預留 Actions 排程延遲）
 - 使用者在當天內查同一天都能 hit cache，避免重複打 MOPS / Groq
 - 連假期間（最長約 4–5 天）結束後，用戶仍可查假期前最後交易日，7 天確保不提早過期
 
@@ -234,3 +239,30 @@ Lock 確保同一 date_key 只有一個請求執行完整流程，其他請求�
 | 7.4 | 低 | `handle_message` 若 `event.source.user_id` 為 None（罕見），`save_user(None)` 會被寫入 Redis |
 | 7.5 | 低 | 多 worker（uvicorn）部署時排程會重複觸發，Render 預設 1 worker 沒問題 |
 | 7.6 | 低 | TWSE 假日 API 若年底未更新隔年資料，跨年初幾天 `_holidays` 可能漏掉新年假日；載入失敗時退化成只跳週末 |
+
+---
+
+## 八、Q3 財報雙成長排行（Discord，至 `Q3_RANK_END_DATE` 2026-11-16 止）
+
+邏輯在 `q3_rank.py`（只用 regex 抓 EPS，不呼叫 Groq），架構比照注意清單：GitHub Actions 預抓 MOPS → Redis → Render 推播。
+
+```
+GitHub Actions 07:00 (Mon–Fri，.github/workflows/fetch_q3.yml)
+  → fetch_q3_job.py
+    → q3_rank_dates()                ← 前一交易日 ~ 昨天（週一含週六、週日）
+    → fetch_announcements(..., redis)← MOPS 清單 + 逐家明細，每抓一家就 HSET q3:eps:{date}
+
+APScheduler 08:30 (Mon–Fri)  scheduled_discord_q3_rank()
+APScheduler 16:30 (Mon–Fri)  scheduled_discord_q3_rank_today()   ← 只查當天
+  → _run_q3_push(slot)
+    → 已有 q3:pushed:{slot}:{今天} → 略過
+    → build_q3_rank_message()
+        → fetch_announcements()      ← 快取命中的公司不再打 MOPS，只補抓沒有的
+        → build_rank()               ← finlab Q1/Q2 EPS、月營收 → 篩選 / 排序
+    → discord_push() 成功 → SET q3:pushed:{slot}:{今天}
+```
+
+- **為什麼要預抓**：財報截止前一天公告可達 300 筆，逐家抓明細（每家 sleep 2s，MOPS 回應也慢）要 40 分鐘以上。2026-11-12 在 Render 上 08:00 直接跑，途中 instance 重啟，資料全失、沒有推播。
+- **快取規則**：明細抓取失敗（逾時 / 非 200）不寫快取，下次重抓；格式無法解析 EPS 則寫 null，不重抓。16:30 抓過的公司，隔天 08:30 直接沿用。
+- **重啟補跑**：`lifespan` 呼叫 `_schedule_q3_catchup()`，若重啟時在 08:30–12:00 / 16:30–21:00 且當日尚未推播，30 秒後補跑。cron 另設 `misfire_grace_time=600`。
+- **Fallback**：GitHub Actions 延遲或未抓完時，Render 08:30 會自己補抓剩下的（與注意清單相同，有 Render IP 被限速風險）。

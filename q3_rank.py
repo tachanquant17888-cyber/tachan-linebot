@@ -68,8 +68,8 @@ def _fetch_quarter_items(session, year: str, month: str, day: str) -> list:
     return items
 
 
-def _fetch_detail_text(session, params: dict) -> str:
-    """抓單筆公告明細，回傳「說明」內文（row[9]）"""
+def _fetch_detail_text(session, params: dict):
+    """抓單筆公告明細，回傳「說明」內文（row[9]）；連線/解析失敗回傳 None（不寫入快取，下次重抓）"""
     try:
         detail = session.post(
             "https://mops.twse.com.tw/mops/api/t05st02_detail",
@@ -78,9 +78,9 @@ def _fetch_detail_text(session, params: dict) -> str:
         ).json()
     except Exception as e:
         print(f"[Q3] 抓取 {params.get('companyId')} 明細失敗: {e}")
-        return ""
+        return None
     if detail.get("code") != 200:
-        return ""
+        return None
     return "\n\n".join(row[9] for row in detail["result"]["data"])
 
 
@@ -122,14 +122,53 @@ def _load_quarter_revenue(western_year: int, stock_ids) -> pd.DataFrame:
     return pd.DataFrame({"Q2營收": quarter_sum([4, 5, 6]), "Q3營收": quarter_sum([7, 8, 9])})
 
 
+# ── Redis 快取（每抓一家就存，重啟後可續抓；16:30 抓過的 08:00 直接沿用）──
+CACHE_KEY_PREFIX = "q3:eps:"          # hash：field=股號，value=累計EPS（JSON，抓不到為 null）
+CACHE_TTL_SECONDS = 14 * 24 * 60 * 60
+
+
+def _load_cache(redis, cache_key: str) -> dict:
+    if redis is None:
+        return {}
+    try:
+        return {cid: json.loads(v) for cid, v in (redis.hgetall(cache_key) or {}).items()}
+    except Exception as e:
+        print(f"[Q3] 讀取快取 {cache_key} 失敗: {e}")
+        return {}
+
+
+def _save_cache(redis, cache_key: str, company_id: str, eps):
+    if redis is None:
+        return
+    try:
+        redis.hset(cache_key, company_id, json.dumps(eps))
+        redis.expire(cache_key, CACHE_TTL_SECONDS)
+    except Exception as e:
+        print(f"[Q3] 寫入快取 {cache_key} 失敗: {e}")
+
+
 # ── 主流程 ───────────────────────────────────
-def fetch_announcements(session, year: str, month: str, day: str) -> pd.DataFrame:
-    """year 為民國年；只用 regex 抓累計 EPS，抓不到的 累計eps 為 NaN"""
+def fetch_announcements(session, year: str, month: str, day: str, redis=None) -> pd.DataFrame:
+    """year 為民國年；只用 regex 抓累計 EPS，抓不到的 累計eps 為 NaN
+    redis 有給時，已快取的公司不再抓明細，新抓的逐筆寫入快取"""
     items = _fetch_quarter_items(session, year, month, day)
+    cache_key = f"{CACHE_KEY_PREFIX}{year}{month.zfill(2)}{day.zfill(2)}"
+    cache = _load_cache(redis, cache_key)
+    hits = 0
     for item in items:
-        item["累計eps"] = parse_eps(_fetch_detail_text(session, item.pop("params")))
-        print(f"[Q3] {item['company_id']} {item['company_name']}: 累計EPS={item['累計eps']}")
+        params = item.pop("params")
+        cid = item["company_id"]
+        if cid in cache:
+            item["累計eps"] = cache[cid]
+            hits += 1
+            continue
+        text = _fetch_detail_text(session, params)
+        item["累計eps"] = parse_eps(text) if text is not None else None
+        if text is not None:
+            _save_cache(redis, cache_key, cid, item["累計eps"])
+        print(f"[Q3] {cid} {item['company_name']}: 累計EPS={item['累計eps']}")
         time.sleep(2)
+    print(f"[Q3] {year}/{month}/{day} 快取命中 {hits}/{len(items)} 筆")
     return pd.DataFrame(items, columns=["date", "company_id", "company_name", "累計eps"])
 
 
@@ -170,12 +209,12 @@ def to_text(df_rank: pd.DataFrame, date_label: str, n_ann: int, missing: list) -
     return "\n".join(lines)
 
 
-def build_q3_rank_text(session, dates: list) -> str:
+def build_q3_rank_text(session, dates: list, redis=None) -> str:
     """dates 為 [(民國年, 月, 日), ...] 字串 tuple（例如週一時含上週五+週六+週日），合併成一份排行"""
     dates = list(dates)
     first, last = "/".join(dates[0]), "/".join(dates[-1])
     date_label = first if first == last else f"{first}~{last}"
-    frames = [fetch_announcements(session, y, m, d) for y, m, d in dates]
+    frames = [fetch_announcements(session, y, m, d, redis) for y, m, d in dates]
     df = pd.concat(frames, ignore_index=True).drop_duplicates("company_id", keep="last")
     if df.empty:
         return f"📊 {date_label} 無 Q3 財報公告"

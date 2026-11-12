@@ -741,20 +741,22 @@ def scheduled_push():
 
 
 # ── Discord 推播 ─────────────────────────────
-def discord_push(content: str, env_key: str = "DISCORD_WEBHOOK_URL"):
-    """透過 Discord 頻道 webhook 推播文字訊息（webhook 網址由環境變數 env_key 設定）"""
+def discord_push(content: str, env_key: str = "DISCORD_WEBHOOK_URL") -> bool:
+    """透過 Discord 頻道 webhook 推播文字訊息（webhook 網址由環境變數 env_key 設定），回傳是否成功"""
     url = os.getenv(env_key)
     if not url:
         print(f"⚠️ 未設定 {env_key}，略過 Discord 推播")
-        return
+        return False
     chunks = _split_discord_chunks(content)
     try:
         for chunk in chunks:
             r = requests.post(url, json={"content": chunk}, timeout=10)
             r.raise_for_status()
         print(f"[Discord] 推播成功（{len(chunks)} 則）: {content[:30]}")
+        return True
     except Exception as e:
         print(f"[Discord] 推播失敗: {e}")
+        return False
 
 
 def _split_discord_chunks(content: str) -> list:
@@ -785,36 +787,92 @@ def scheduled_discord_push():
 Q3_RANK_END_DATE = "2026-11-16 23:59:59"   # Q3 財報季到 11/15，11/16 推最後一次（含 11/13~11/15）
 
 
+def q3_rank_dates(today_only: bool = False) -> list:
+    """today_only=False：前一交易日 ~ 昨天；True：只有今天。回傳 [(民國年, 月, 日), ...]
+    （GitHub Actions 07:00 預抓與 Render 08:30 推播共用，確保抓同一組日期）"""
+    now = datetime.now(TZ)
+    if today_only:
+        return [to_roc_ymd(now.date())]
+    d, yesterday = get_last_trading_day(now).date(), (now - timedelta(days=1)).date()
+    dates = []
+    while d <= yesterday:
+        dates.append(to_roc_ymd(d))
+        d += timedelta(days=1)
+    return dates
+
+
 def build_q3_rank_message(today_only: bool = False) -> str:
     """Q3 財報 EPS+營收 QoQ 雙成長排行（只用 regex，不呼叫 Groq）
     today_only=False：前一交易日 ~ 昨天（週一會含週六、週日，截止日前公司週末也會公告）
     today_only=True ：只查今天（16:30 推播當日已公告的部分）"""
-    now = datetime.now(TZ)
-    if today_only:
-        dates = [to_roc_ymd(now.date())]
-    else:
-        d, yesterday = get_last_trading_day(now).date(), (now - timedelta(days=1)).date()
-        dates = []
-        while d <= yesterday:
-            dates.append(to_roc_ymd(d))
-            d += timedelta(days=1)
+    dates = q3_rank_dates(today_only)
     try:
         from q3_rank import build_q3_rank_text
-        message = build_q3_rank_text(_create_mops_session(), dates)
+        message = build_q3_rank_text(_create_mops_session(), dates, redis_client)
     except Exception as e:
         print(f"[Q3排行] 失敗: {e}")
         message = f"⚠️ Q3財報排行推播失敗（{'/'.join(dates[-1])}）\n錯誤：{type(e).__name__}"
     return message
 
 
+# 推播成功後記一筆 Redis 旗標；Render 重啟時 lifespan 依旗標判斷是否補跑
+Q3_PUSHED_KEY_PREFIX = "q3:pushed:"
+Q3_CATCHUP_WINDOWS = {            # 排程名稱: (排程時間, 重啟後補跑的截止時間)
+    "morning": ((8, 30), (12, 0)),
+    "today": ((16, 30), (21, 0)),
+}
+
+
+def _q3_pushed_key(slot: str) -> str:
+    return f"{Q3_PUSHED_KEY_PREFIX}{slot}:{datetime.now(TZ).strftime('%Y%m%d')}"
+
+
+def _is_q3_pushed(slot: str) -> bool:
+    if redis_client is None:
+        return False
+    try:
+        return bool(redis_client.get(_q3_pushed_key(slot)))
+    except Exception as e:
+        print(f"[Q3排行] 讀取推播旗標失敗: {e}")
+        return False
+
+
+def _run_q3_push(slot: str, today_only: bool):
+    if _is_q3_pushed(slot):
+        print(f"[Q3排行] {slot} 今日已推播，略過")
+        return
+    if discord_push(build_q3_rank_message(today_only=today_only), env_key="DISCORD_WEBHOOK_URL_Q3") \
+            and redis_client is not None:
+        try:
+            redis_client.set(_q3_pushed_key(slot), "1", ex=2 * 24 * 60 * 60)
+        except Exception as e:
+            print(f"[Q3排行] 寫入推播旗標失敗: {e}")
+
+
 def scheduled_discord_q3_rank():
-    """每日 08:00 推播前一交易日 ~ 昨天的 Q3 財報排行到 Discord"""
-    discord_push(build_q3_rank_message(), env_key="DISCORD_WEBHOOK_URL_Q3")
+    """每日 08:30 推播前一交易日 ~ 昨天的 Q3 財報排行到 Discord
+    （MOPS 明細由 GitHub Actions 07:00 預抓存 Redis，這裡只補抓快取沒有的）"""
+    _run_q3_push("morning", today_only=False)
 
 
 def scheduled_discord_q3_rank_today():
     """每日 16:30 推播當日已公告的 Q3 財報排行到 Discord"""
-    discord_push(build_q3_rank_message(today_only=True), env_key="DISCORD_WEBHOOK_URL_Q3")
+    _run_q3_push("today", today_only=True)
+
+
+def _schedule_q3_catchup(scheduler):
+    """Render 在推播途中重啟（記憶體不足/平台重啟）時，啟動後若仍在補跑時段且今日未推播，30 秒後補跑；
+    MOPS 已抓的明細存在 Redis，補跑只需抓剩下的"""
+    now = datetime.now(TZ)
+    if now.weekday() >= 5 or now > datetime.strptime(Q3_RANK_END_DATE, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ):
+        return
+    jobs = {"morning": scheduled_discord_q3_rank, "today": scheduled_discord_q3_rank_today}
+    for slot, ((sh, sm), (eh, em)) in Q3_CATCHUP_WINDOWS.items():
+        start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+        if start <= now < end and not _is_q3_pushed(slot):
+            scheduler.add_job(jobs[slot], 'date', run_date=now + timedelta(seconds=30), id=f'q3_catchup_{slot}')
+            print(f"🔁 Q3 排行 {slot} 今日尚未推播，30 秒後補跑")
 
 
 # ── Lifespan ──────────────────────────────────
@@ -849,18 +907,19 @@ async def lifespan(_app: FastAPI):
     print("✅ 已排程每日 07:30 推播前一交易日注意清單到 Discord")
     scheduler.add_job(
         scheduled_discord_q3_rank, 'cron',
-        day_of_week='mon-fri', hour=8, minute=0,
-        end_date=Q3_RANK_END_DATE,
+        day_of_week='mon-fri', hour=8, minute=30,
+        end_date=Q3_RANK_END_DATE, misfire_grace_time=600, coalesce=True,
         id='discord_q3_rank'
     )
-    print(f"✅ 已排程每日 08:00 推播 Q3 財報雙成長排行到 Discord（至 {Q3_RANK_END_DATE[:10]}）")
+    print(f"✅ 已排程每日 08:30 推播 Q3 財報雙成長排行到 Discord（至 {Q3_RANK_END_DATE[:10]}）")
     scheduler.add_job(
         scheduled_discord_q3_rank_today, 'cron',
         day_of_week='mon-fri', hour=16, minute=30,
-        end_date=Q3_RANK_END_DATE,
+        end_date=Q3_RANK_END_DATE, misfire_grace_time=600, coalesce=True,
         id='discord_q3_rank_today'
     )
     print(f"✅ 已排程每日 16:30 推播當日 Q3 財報雙成長排行到 Discord（至 {Q3_RANK_END_DATE[:10]}）")
+    _schedule_q3_catchup(scheduler)
     scheduler.start()
     print("✅ Scheduler 已啟動")
     yield
